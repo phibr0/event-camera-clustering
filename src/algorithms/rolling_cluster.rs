@@ -1,4 +1,6 @@
+use crate::algorithms::EventAlgorithm;
 use crate::event::{BoundingBox, Event};
+use crate::{EventError, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy)]
@@ -10,31 +12,6 @@ pub struct RollingClusterTrackerConfig {
     pub min_cells: usize,
     pub max_bbox_width: u16,
     pub max_bbox_height: u16,
-    pub polarity_filter: PolarityFilter,
-    pub invert_polarity: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolarityFilter {
-    All,
-    Positive,
-    Negative,
-}
-
-impl PolarityFilter {
-    fn accepts(self, event: Event, invert_polarity: bool) -> bool {
-        let polarity = if invert_polarity {
-            !event.polarity
-        } else {
-            event.polarity
-        };
-
-        match self {
-            Self::All => true,
-            Self::Positive => polarity,
-            Self::Negative => !polarity,
-        }
-    }
 }
 
 impl Default for RollingClusterTrackerConfig {
@@ -47,9 +24,31 @@ impl Default for RollingClusterTrackerConfig {
             min_cells: 3,
             max_bbox_width: 200,
             max_bbox_height: 200,
-            polarity_filter: PolarityFilter::All,
-            invert_polarity: true,
         }
+    }
+}
+
+impl RollingClusterTrackerConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.window_us == 0 {
+            return Err(EventError::InvalidConfig {
+                field: "window_us",
+                message: "must be positive",
+            });
+        }
+        if self.step_us == 0 {
+            return Err(EventError::InvalidConfig {
+                field: "step_us",
+                message: "must be positive",
+            });
+        }
+        if self.cell_size == 0 {
+            return Err(EventError::InvalidConfig {
+                field: "cell_size",
+                message: "must be positive",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -90,17 +89,15 @@ struct ClusterAccum {
 }
 
 impl RollingClusterTracker {
-    pub fn new(config: RollingClusterTrackerConfig) -> Self {
-        assert!(config.window_us > 0, "window_us must be positive");
-        assert!(config.step_us > 0, "step_us must be positive");
-        assert!(config.cell_size > 0, "cell_size must be positive");
+    pub fn new(config: RollingClusterTrackerConfig) -> Result<Self> {
+        config.validate()?;
 
-        Self {
+        Ok(Self {
             config,
             events: VecDeque::new(),
             next_emit_us: None,
             previous_centroid: None,
-        }
+        })
     }
 
     pub fn process_event(&mut self, event: Event) -> Vec<ClusterDetection> {
@@ -134,11 +131,10 @@ impl RollingClusterTracker {
         Some(detection)
     }
 
-    pub fn set_config(&mut self, config: RollingClusterTrackerConfig) {
-        assert!(config.window_us > 0, "window_us must be positive");
-        assert!(config.step_us > 0, "step_us must be positive");
-        assert!(config.cell_size > 0, "cell_size must be positive");
+    pub fn set_config(&mut self, config: RollingClusterTrackerConfig) -> Result<()> {
+        config.validate()?;
         self.config = config;
+        Ok(())
     }
 
     fn drop_old_events(&mut self, now_us: u64) {
@@ -157,12 +153,7 @@ impl RollingClusterTracker {
         let mut cells: HashMap<(u16, u16), CellAccum> = HashMap::new();
 
         for event in self.events.iter().filter(|event| {
-            event.timestamp_us >= window_start_us
-                && event.timestamp_us <= timestamp_us
-                && self
-                    .config
-                    .polarity_filter
-                    .accepts(**event, self.config.invert_polarity)
+            event.timestamp_us >= window_start_us && event.timestamp_us <= timestamp_us
         }) {
             let key = (
                 event.x / self.config.cell_size,
@@ -244,6 +235,18 @@ impl RollingClusterTracker {
         }
 
         best.map(|(_, cluster)| cluster)
+    }
+}
+
+impl EventAlgorithm for RollingClusterTracker {
+    type Output = ClusterDetection;
+
+    fn process_event(&mut self, event: Event) -> Vec<Self::Output> {
+        RollingClusterTracker::process_event(self, event)
+    }
+
+    fn finish(&mut self) -> Vec<Self::Output> {
+        RollingClusterTracker::finish(self).into_iter().collect()
     }
 }
 
@@ -345,9 +348,8 @@ mod tests {
             min_cells: 3,
             max_bbox_width: 20,
             max_bbox_height: 20,
-            polarity_filter: PolarityFilter::All,
-            invert_polarity: false,
-        });
+        })
+        .unwrap();
 
         let events = [
             Event {
@@ -398,115 +400,10 @@ mod tests {
     }
 
     #[test]
-    fn can_cluster_only_positive_events() {
-        let mut tracker = RollingClusterTracker::new(RollingClusterTrackerConfig {
-            window_us: 10_000,
-            step_us: 1_000,
-            cell_size: 1,
-            min_events: 3,
-            min_cells: 3,
-            max_bbox_width: 20,
-            max_bbox_height: 20,
-            polarity_filter: PolarityFilter::Positive,
-            invert_polarity: false,
-        });
+    fn rejects_invalid_config() {
+        let mut config = RollingClusterTrackerConfig::default();
+        config.cell_size = 0;
 
-        let events = [
-            Event {
-                timestamp_us: 0,
-                x: 10,
-                y: 10,
-                polarity: false,
-            },
-            Event {
-                timestamp_us: 100,
-                x: 11,
-                y: 10,
-                polarity: false,
-            },
-            Event {
-                timestamp_us: 200,
-                x: 12,
-                y: 10,
-                polarity: false,
-            },
-            Event {
-                timestamp_us: 300,
-                x: 50,
-                y: 50,
-                polarity: true,
-            },
-            Event {
-                timestamp_us: 400,
-                x: 51,
-                y: 50,
-                polarity: true,
-            },
-            Event {
-                timestamp_us: 1_000,
-                x: 50,
-                y: 51,
-                polarity: true,
-            },
-        ];
-
-        let detections = events
-            .into_iter()
-            .flat_map(|event| tracker.process_event(event))
-            .collect::<Vec<_>>();
-
-        assert_eq!(detections.len(), 1);
-        assert_eq!(detections[0].event_count, 3);
-        assert_eq!(detections[0].bbox.min_x, 50);
-    }
-
-    #[test]
-    fn can_invert_polarity_filtering() {
-        let mut tracker = RollingClusterTracker::new(RollingClusterTrackerConfig {
-            window_us: 10_000,
-            step_us: 1_000,
-            cell_size: 1,
-            min_events: 3,
-            min_cells: 3,
-            max_bbox_width: 20,
-            max_bbox_height: 20,
-            polarity_filter: PolarityFilter::Positive,
-            invert_polarity: true,
-        });
-
-        let events = [
-            Event {
-                timestamp_us: 0,
-                x: 10,
-                y: 10,
-                polarity: false,
-            },
-            Event {
-                timestamp_us: 100,
-                x: 11,
-                y: 10,
-                polarity: false,
-            },
-            Event {
-                timestamp_us: 1_000,
-                x: 10,
-                y: 11,
-                polarity: false,
-            },
-            Event {
-                timestamp_us: 1_100,
-                x: 50,
-                y: 50,
-                polarity: true,
-            },
-        ];
-
-        let detections = events
-            .into_iter()
-            .flat_map(|event| tracker.process_event(event))
-            .collect::<Vec<_>>();
-
-        assert_eq!(detections.len(), 1);
-        assert_eq!(detections[0].bbox.min_x, 10);
+        assert!(RollingClusterTracker::new(config).is_err());
     }
 }
