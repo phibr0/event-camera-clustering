@@ -5,8 +5,8 @@ use clap::{Args, Parser, ValueEnum};
 use event_clustering::algorithms::{
     ClusterDetection, RollingClusterTracker, RollingClusterTrackerConfig,
 };
-use event_clustering::filters::{
-    EventFilterChain, PolarityFilterConfig, PolarityMode, StaticEventFilterConfig,
+use event_clustering::filter::{
+    ConfiguredEventFilters, PolarityFilterConfig, PolarityMode, StaticEventFilterConfig,
 };
 use event_clustering::parser::{Endian, EventFormat, open_event_stream};
 use event_clustering::pipeline::EventPipeline;
@@ -80,7 +80,7 @@ fn track_ball(
     }
 
     let tracker = RollingClusterTracker::new(config)?;
-    let filters = EventFilterChain::new(polarity_filter_config, static_filter_config)?;
+    let filters = ConfiguredEventFilters::new(polarity_filter_config, static_filter_config)?;
     let mut pipeline = EventPipeline::new(opened.stream, filters, tracker);
     let mut event_count = 0_u64;
     let mut detection_count = 0_u64;

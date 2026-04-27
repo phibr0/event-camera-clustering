@@ -1,4 +1,4 @@
-use crate::evt2::ExtTrigger;
+use super::evt2::ExtTrigger;
 use crate::parser::{Endian, EventRecord, EventStream};
 use crate::{Event, Result};
 use std::collections::VecDeque;

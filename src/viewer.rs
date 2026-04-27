@@ -4,8 +4,8 @@ use event_clustering::Event;
 use event_clustering::algorithms::{
     ClusterDetection, RollingClusterTracker, RollingClusterTrackerConfig,
 };
-use event_clustering::filters::{
-    EventFilterChain, PolarityFilterConfig, PolarityMode, StaticEventFilterConfig,
+use event_clustering::filter::{
+    ConfiguredEventFilters, PolarityFilterConfig, PolarityMode, StaticEventFilterConfig,
 };
 use event_clustering::parser::{Endian, EventFormat, open_event_stream};
 use event_clustering::pipeline::EventPipeline;
@@ -534,7 +534,7 @@ struct WorkerState {
     endian: Endian,
     controls: Arc<Mutex<ViewerControls>>,
     frame: Arc<Mutex<ViewerFrame>>,
-    pipeline: Option<EventPipeline<EventFilterChain, RollingClusterTracker>>,
+    pipeline: Option<EventPipeline<ConfiguredEventFilters, RollingClusterTracker>>,
     render_events: VecDeque<Event>,
     latest_detection: Option<ClusterDetection>,
     buffer: Vec<u32>,
@@ -636,7 +636,7 @@ impl WorkerState {
                     ));
                 }
                 match (
-                    EventFilterChain::new(
+                    ConfiguredEventFilters::new(
                         controls.polarity_filter_config,
                         controls.static_filter_config,
                     ),

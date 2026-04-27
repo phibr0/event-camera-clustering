@@ -1,95 +1,6 @@
-use crate::Event;
-use crate::{EventError, Result};
+use crate::filter::EventFilter;
+use crate::{Event, EventError, Result};
 use std::collections::HashMap;
-
-pub trait EventFilter {
-    fn accepts(&mut self, event: Event) -> bool;
-}
-
-pub struct EventFilterChain {
-    polarity_filter: PolarityEventFilter,
-    static_filter: StaticEventFilter,
-}
-
-impl EventFilterChain {
-    pub fn new(
-        polarity_config: PolarityFilterConfig,
-        static_config: StaticEventFilterConfig,
-    ) -> Result<Self> {
-        Ok(Self {
-            polarity_filter: PolarityEventFilter::new(polarity_config),
-            static_filter: StaticEventFilter::new(static_config)?,
-        })
-    }
-
-    pub fn set_config(
-        &mut self,
-        polarity_config: PolarityFilterConfig,
-        static_config: StaticEventFilterConfig,
-    ) -> Result<()> {
-        self.polarity_filter.set_config(polarity_config);
-        self.static_filter.set_config(static_config)?;
-        Ok(())
-    }
-}
-
-impl EventFilter for EventFilterChain {
-    fn accepts(&mut self, event: Event) -> bool {
-        self.polarity_filter.accepts(event) && self.static_filter.accepts(event)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolarityMode {
-    All,
-    Positive,
-    Negative,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PolarityFilterConfig {
-    pub mode: PolarityMode,
-    pub invert_polarity: bool,
-}
-
-impl Default for PolarityFilterConfig {
-    fn default() -> Self {
-        Self {
-            mode: PolarityMode::All,
-            invert_polarity: true,
-        }
-    }
-}
-
-pub struct PolarityEventFilter {
-    config: PolarityFilterConfig,
-}
-
-impl PolarityEventFilter {
-    pub fn new(config: PolarityFilterConfig) -> Self {
-        Self { config }
-    }
-
-    pub fn set_config(&mut self, config: PolarityFilterConfig) {
-        self.config = config;
-    }
-}
-
-impl EventFilter for PolarityEventFilter {
-    fn accepts(&mut self, event: Event) -> bool {
-        let polarity = if self.config.invert_polarity {
-            !event.polarity
-        } else {
-            event.polarity
-        };
-
-        match self.config.mode {
-            PolarityMode::All => true,
-            PolarityMode::Positive => polarity,
-            PolarityMode::Negative => !polarity,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticEventFilterConfig {
@@ -238,27 +149,6 @@ mod tests {
         assert!(filter.accepts(event_at(0, 10, 10)));
         assert!(filter.accepts(event_at(100, 30, 30)));
         assert!(filter.accepts(event_at(200, 50, 50)));
-    }
-
-    #[test]
-    fn polarity_filter_can_invert_labels() {
-        let mut filter = PolarityEventFilter::new(PolarityFilterConfig {
-            mode: PolarityMode::Positive,
-            invert_polarity: true,
-        });
-
-        assert!(filter.accepts(Event {
-            timestamp_us: 0,
-            x: 0,
-            y: 0,
-            polarity: false,
-        }));
-        assert!(!filter.accepts(Event {
-            timestamp_us: 0,
-            x: 0,
-            y: 0,
-            polarity: true,
-        }));
     }
 
     #[test]

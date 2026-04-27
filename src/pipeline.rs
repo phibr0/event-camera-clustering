@@ -1,7 +1,7 @@
 use crate::Event;
 use crate::Result;
 use crate::algorithms::EventAlgorithm;
-use crate::filters::EventFilter;
+use crate::filter::EventFilter;
 use crate::parser::{EventRecord, EventStream};
 
 #[derive(Debug)]
