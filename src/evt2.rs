@@ -1,13 +1,9 @@
+use crate::Result;
 use crate::event::Event;
+use crate::parser::Endian;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Endian {
-    Little,
-    Big,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawHeader {
@@ -36,36 +32,37 @@ pub struct Evt2Reader<R> {
 }
 
 impl Evt2Reader<BufReader<File>> {
-    pub fn from_path(path: impl AsRef<Path>, endian: Endian) -> io::Result<(RawHeader, Self)> {
+    pub fn from_path(path: impl AsRef<Path>, endian: Endian) -> Result<(RawHeader, Self)> {
         let file = File::open(path)?;
         Self::new(BufReader::new(file), endian)
     }
 }
 
 impl<R: BufRead> Evt2Reader<R> {
-    pub fn new(mut reader: R, endian: Endian) -> io::Result<(RawHeader, Self)> {
+    pub fn new(mut reader: R, endian: Endian) -> Result<(RawHeader, Self)> {
         let header = read_raw_header(&mut reader)?;
-        Ok((
-            header,
-            Self {
-                reader,
-                endian,
-                time_high: None,
-            },
-        ))
+        Ok((header, Self::from_reader(reader, endian)))
     }
 
-    pub fn next_decoded(&mut self) -> io::Result<Option<DecodedEvt2>> {
+    pub(crate) fn from_reader(reader: R, endian: Endian) -> Self {
+        Self {
+            reader,
+            endian,
+            time_high: None,
+        }
+    }
+
+    pub fn next_decoded(&mut self) -> Result<Option<DecodedEvt2>> {
         loop {
             let mut bytes = [0_u8; 4];
             match self.reader.read_exact(&mut bytes) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
 
             let word = match self.endian {
-                Endian::Little => u32::from_le_bytes(bytes),
+                Endian::Little | Endian::Little32 => u32::from_le_bytes(bytes),
                 Endian::Big => u32::from_be_bytes(bytes),
             };
 
@@ -77,14 +74,14 @@ impl<R: BufRead> Evt2Reader<R> {
 }
 
 impl<R: BufRead> Iterator for Evt2Reader<R> {
-    type Item = io::Result<DecodedEvt2>;
+    type Item = Result<DecodedEvt2>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_decoded().transpose()
     }
 }
 
-fn read_raw_header<R: BufRead>(reader: &mut R) -> io::Result<RawHeader> {
+pub(crate) fn read_raw_header<R: BufRead>(reader: &mut R) -> Result<RawHeader> {
     let mut lines = Vec::new();
     let mut evt_version = None;
 

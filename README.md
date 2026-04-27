@@ -4,9 +4,13 @@ Rust tools for parsing Prophesee EVT2 `.raw` event-camera captures and tracking 
 
 ## Features
 
-- Streams EVT2 data from Prophesee RAW files.
+- Streams event data through a modular parser interface.
+- Implements EVT2.0, EVT2.1, and EVT3 decoding.
 - Reconstructs event timestamps from `EVT_TIME_HIGH` words.
 - Tracks clusters over a rolling time window.
+- Supports modular event filters before clustering.
+- Uses polarity selection as a filter rather than coupling it to clustering.
+- Can suppress static flicker sources such as background LEDs.
 - Reports centroid, bounding box, event count, and confidence.
 - Provides an interactive viewer with sliders, toggles, and tooltips.
 - Runs parsing, tracking, and frame rendering on a worker thread so the UI stays responsive.
@@ -71,6 +75,17 @@ The left panel contains grouped controls. Hover any control for a short explanat
 - `use events`: cluster using all events, positive-only events, or negative-only events.
 - `invert labels`: swaps positive/negative interpretation for clustering labels and render colors. This is enabled by default because the sample capture appeared swapped.
 
+Polarity is implemented as a modular event filter. Events that do not match the selected polarity are dropped before clustering.
+
+### Static Filter
+
+- `enabled`: suppress event cells that keep firing in the same location over time.
+- `cell size`: spatial bin size used by the static filter.
+- `static after us`: how long a cell must remain active before it can be suppressed.
+- `min events`: how many events are required before a cell can be considered static.
+
+This is intended for background flicker sources, such as stationary LEDs. Moving objects should pass through cells before they become static.
+
 ### Performance
 
 - `events/tick`: worker-thread event budget per UI update. Increase for faster catch-up/playback; decrease if CPU usage is too high.
@@ -83,6 +98,22 @@ View positive events only for clustering:
 
 ```bash
 cargo run -- spinner.raw view --polarity positive
+```
+
+Enable static-event filtering for flickering LEDs:
+
+```bash
+cargo run -- spinner.raw view --filter-static
+```
+
+Tune the static filter:
+
+```bash
+cargo run -- spinner.raw view \
+  --filter-static \
+  --static-cell-size 4 \
+  --static-after-us 250000 \
+  --static-min-events 200
 ```
 
 Use raw EVT2 ON/OFF polarity labels instead of the default inverted labels:
@@ -135,31 +166,77 @@ cargo run -- spinner.raw track-ball \
 --polarity <mode>         all, positive/on/+, or negative/off/-; default all
 --invert-polarity         invert positive/negative labels
 --raw-polarity            use raw EVT2 ON/OFF labels
+--filter-static           suppress cells that stay active in one place
+--static-cell-size <px>   static filter cell size, default 4
+--static-after-us <us>    mark cells static after this duration, default 250000
+--static-min-events <n>   minimum events before a cell is static, default 200
+--static-inactive-us <us> forget inactive static cells, default 1000000
+--format <format>         auto, evt2, evt21, or evt3; default auto
 --width <px>              viewer width, default 640
 --height <px>             viewer height, default 480
 --speed <factor>          playback speed, default 1.0; use 0 for fastest
 --events-per-tick <n>     worker event budget per UI update, default 5000
 --max-detections <count>  stop text output after this many detections
---endian <little|big>     EVT2 word endianness, default little
+--endian <mode>           little, little32, or big; default little
 ```
 
-## EVT2 Parser Notes
+## Parser Notes
 
-The parser handles Prophesee EVT2 RAW files with a text header followed by 32-bit EVT2 words. It currently decodes:
+The event input layer is built around a modular parser interface:
+
+```rust
+trait EventStream {
+    fn next_record(&mut self) -> io::Result<Option<EventRecord>>;
+}
+```
+
+The CLI accepts:
+
+```bash
+--format auto
+--format evt2
+--format evt21
+--format evt3
+```
+
+`auto` reads the RAW header and selects the parser based on `% evt ...`.
+
+Use `--endian little32` for EVT2.1 streams that transmit each 32-bit half of the 64-bit word in little-endian order, as documented for IMX636.
+
+Current implementation status:
+
+- `evt2`: implemented.
+- `evt21`: implemented.
+- `evt3`: implemented.
+
+This keeps the downstream tracker and filters independent of the underlying event encoding.
+
+## Event Parser Notes
+
+The parser handles Prophesee RAW files with a text header followed by EVT words. EVT2.0 uses 32-bit words, EVT2.1 uses 64-bit vector words, and EVT3 uses 16-bit stateful words. It currently decodes:
 
 - `CD_OFF`
 - `CD_ON`
 - `EVT_TIME_HIGH`
 - `EXT_TRIGGER`
+- EVT2.1 vector CD events
+- EVT3 address and vector CD events
 
 Vendor-specific or reserved words are surfaced as `Other` values and ignored by the tracker.
 
 ## Project Layout
 
 ```text
-src/main.rs                    CLI and interactive viewer
+src/main.rs                    CLI and text-mode tracking
+src/viewer.rs                  Interactive viewer and worker thread
+src/render.rs                  Software RGB rendering helpers
 src/event.rs                   Event and bounding-box types
 src/evt2.rs                    EVT2 RAW parser
+src/parser.rs                  Modular parser interface and format selection
+src/parser/evt21.rs            EVT2.1 vector parser
+src/parser/evt3.rs             EVT3 stateful parser
+src/filters.rs                 Modular event filters
+src/pipeline.rs                Shared parser/filter/algorithm event pipeline
 src/algorithms/rolling_cluster.rs  Rolling-window clustering tracker
 ```
 
