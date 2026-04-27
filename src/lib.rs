@@ -1,8 +1,7 @@
 pub mod algorithms;
 pub mod error;
 pub mod event;
-pub mod evt2;
-pub mod filters;
+pub mod filter;
 pub mod parser;
 pub mod pipeline;
 
