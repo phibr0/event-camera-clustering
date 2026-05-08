@@ -1,3 +1,5 @@
+# achtung: vibe coding deluxe
+
 # event-camera-clustering
 
 ## Getting started
