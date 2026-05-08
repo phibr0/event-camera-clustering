@@ -102,6 +102,12 @@ pub fn open_event_stream(
     }
 }
 
+pub fn read_event_header(path: impl AsRef<Path>) -> Result<RawHeader> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    read_raw_header(&mut reader)
+}
+
 fn open_auto_stream(path: impl AsRef<Path>, endian: Endian) -> Result<OpenedEventStream> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);

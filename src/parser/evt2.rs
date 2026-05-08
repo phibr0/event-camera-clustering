@@ -9,6 +9,8 @@ use std::path::Path;
 pub struct RawHeader {
     pub lines: Vec<String>,
     pub evt_version: Option<String>,
+    pub width: Option<usize>,
+    pub height: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +86,8 @@ impl<R: BufRead> Iterator for Evt2Reader<R> {
 pub(crate) fn read_raw_header<R: BufRead>(reader: &mut R) -> Result<RawHeader> {
     let mut lines = Vec::new();
     let mut evt_version = None;
+    let mut width = None;
+    let mut height = None;
 
     loop {
         let buffer = reader.fill_buf()?;
@@ -98,11 +102,41 @@ pub(crate) fn read_raw_header<R: BufRead>(reader: &mut R) -> Result<RawHeader> {
         if let Some(value) = line.strip_prefix("% evt ") {
             evt_version = Some(value.to_owned());
         }
+        if let Some((parsed_width, parsed_height)) = parse_geometry(&line) {
+            width = Some(parsed_width);
+            height = Some(parsed_height);
+        }
 
         lines.push(line);
     }
 
-    Ok(RawHeader { lines, evt_version })
+    Ok(RawHeader {
+        lines,
+        evt_version,
+        width,
+        height,
+    })
+}
+
+fn parse_geometry(line: &str) -> Option<(usize, usize)> {
+    if let Some(value) = line.strip_prefix("% geometry ") {
+        let (width, height) = value.split_once('x')?;
+        return Some((width.parse().ok()?, height.parse().ok()?));
+    }
+
+    let value = line.strip_prefix("% format ")?;
+    let (_, params) = value.split_once(';')?;
+    let mut width = None;
+    let mut height = None;
+    for part in params.split(';') {
+        if let Some(value) = part.strip_prefix("width=") {
+            width = value.parse().ok();
+        }
+        if let Some(value) = part.strip_prefix("height=") {
+            height = value.parse().ok();
+        }
+    }
+    Some((width?, height?))
 }
 
 fn decode_word(word: u32, time_high: &mut Option<u32>) -> Option<DecodedEvt2> {
@@ -155,6 +189,15 @@ mod tests {
         assert_eq!(header.evt_version.as_deref(), Some("2.0"));
         assert_eq!(header.lines.len(), 2);
         assert!(reader.next_decoded().unwrap().is_none());
+    }
+
+    #[test]
+    fn reads_geometry_from_raw_header() {
+        let bytes = b"% evt 3.0\n% format EVT3;height=720;width=1280\n% geometry 1280x720\n";
+        let (header, _) = Evt2Reader::new(Cursor::new(bytes), Endian::Little).unwrap();
+
+        assert_eq!(header.width, Some(1280));
+        assert_eq!(header.height, Some(720));
     }
 
     #[test]

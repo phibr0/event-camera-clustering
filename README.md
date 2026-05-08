@@ -9,9 +9,10 @@ Rust tools for parsing Prophesee EVT2 `.raw` event-camera captures and tracking 
 - Reconstructs event timestamps from `EVT_TIME_HIGH` words.
 - Tracks clusters over a rolling time window.
 - Supports modular event filters before clustering.
+- Can remove isolated noise with a background activity filter.
 - Uses polarity selection as a filter rather than coupling it to clustering.
 - Can suppress static flicker sources such as background LEDs.
-- Reports centroid, bounding box, event count, and confidence.
+- Reports centroid, bounding box, event count, confidence, and optional RANSAC circle fit.
 - Provides an interactive viewer with sliders, toggles, and tooltips.
 - Runs parsing, tracking, and frame rendering on a worker thread so the UI stays responsive.
 
@@ -46,8 +47,10 @@ The viewer shows recent events and overlays the current cluster detection:
 
 - Positive events: white
 - Negative events: blue
+- Filtered events: hidden by default, or dim gray/dim blue when `show filtered events` is enabled
 - Bounding box: red
 - Centroid: yellow cross
+- 3D ball view: OpenGL XYZ position and recent trajectory when Ball Projection is enabled; drag to orbit and scroll to zoom
 
 The left panel contains grouped controls. Hover any control for a short explanation.
 
@@ -55,6 +58,7 @@ The left panel contains grouped controls. Hover any control for a short explanat
 
 - `Play/Pause`: pause or resume file playback.
 - `Restart`: rewind the RAW file and clear tracker state.
+- `timeline us`: scrub through the recording by event timestamp. Moving the slider pauses playback and seeks to that point.
 - `speed`: playback speed relative to event timestamps. `1.0` is real time, `0.5` is half speed, `2.0` is double speed, and `0.0` processes as fast as possible.
 
 ### Cluster Window
@@ -69,6 +73,8 @@ The left panel contains grouped controls. Hover any control for a short explanat
 - `min cells`: reject clusters occupying too few spatial cells. Useful for ignoring hot pixels.
 - `max bbox w`: reject clusters wider than this.
 - `max bbox h`: reject clusters taller than this.
+- `circle fit`: fit a circle to events in the selected cluster.
+- `circle tol px`: radial inlier tolerance for RANSAC circle fitting.
 
 ### Polarity
 
@@ -76,6 +82,14 @@ The left panel contains grouped controls. Hover any control for a short explanat
 - `invert labels`: swaps positive/negative interpretation for clustering labels and render colors. This is enabled by default because the sample capture appeared swapped.
 
 Polarity is implemented as a modular event filter. Events that do not match the selected polarity are dropped before clustering.
+
+### Background Activity Filter
+
+- `enabled`: suppress isolated events that have no recent neighbor nearby.
+- `radius px`: spatial neighbor radius.
+- `time window us`: how recently a neighboring event must have occurred.
+
+This is intended for random sensor noise. The first event in a local burst is suppressed, then nearby follow-up events pass through.
 
 ### Static Filter
 
@@ -88,6 +102,7 @@ This is intended for background flicker sources, such as stationary LEDs. Moving
 
 ### Performance
 
+- `show filtered events`: display rejected events dimmed instead of hiding them.
 - `events/tick`: worker-thread event budget per UI update. Increase for faster catch-up/playback; decrease if CPU usage is too high.
 
 `speed` and `events/tick` are different: `speed` is the target playback rate, while `events/tick` is how much work the worker is allowed to do to keep up.
@@ -163,9 +178,18 @@ cargo run -- spinner.raw track-ball \
 --min-cells <count>       minimum occupied cells, default 3
 --max-bbox-width <px>     reject wider clusters, default 200
 --max-bbox-height <px>    reject taller clusters, default 200
+--no-circle-fit           disable RANSAC circle fitting, enabled by default
+--circle-inlier-tolerance-px <px>
+                          circle-fit radial inlier tolerance, default 2.5
 --polarity <mode>         all, positive/on/+, or negative/off/-; default all
 --invert-polarity         invert positive/negative labels
 --raw-polarity            use raw EVT2 ON/OFF labels
+--filter-background-activity
+                          suppress isolated events without recent spatial neighbors
+--background-radius-px <px>
+                          background activity neighbor radius, default 2
+--background-time-window-us <us>
+                          background activity neighbor time window, default 5000
 --filter-static           suppress cells that stay active in one place
 --static-cell-size <px>   static filter cell size, default 4
 --static-after-us <us>    mark cells static after this duration, default 250000

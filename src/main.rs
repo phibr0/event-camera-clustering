@@ -6,7 +6,8 @@ use event_clustering::algorithms::{
     ClusterDetection, RollingClusterTracker, RollingClusterTrackerConfig,
 };
 use event_clustering::filter::{
-    ConfiguredEventFilters, PolarityFilterConfig, PolarityMode, StaticEventFilterConfig,
+    BackgroundActivityFilterConfig, ConfiguredEventFilters, PolarityFilterConfig, PolarityMode,
+    StaticEventFilterConfig,
 };
 use event_clustering::parser::{Endian, EventFormat, open_event_stream};
 use event_clustering::pipeline::EventPipeline;
@@ -26,6 +27,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse_from(normalize_args(env::args().collect()));
     let tracker_config = cli.tracking.tracker_config();
     let polarity_filter_config = cli.filters.polarity_config();
+    let background_activity_filter_config = cli.filters.background_activity_config();
     let static_filter_config = cli.filters.static_config();
     let format = cli.parser.format.unwrap_or_default();
     let endian = cli.parser.endian.unwrap_or(Endian::Little);
@@ -35,6 +37,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             cli.path,
             tracker_config,
             polarity_filter_config,
+            background_activity_filter_config,
             static_filter_config,
             format,
             endian,
@@ -44,6 +47,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             cli.path,
             tracker_config,
             polarity_filter_config,
+            background_activity_filter_config,
             static_filter_config,
             cli.view.view_config(),
             format,
@@ -66,6 +70,7 @@ fn track_ball(
     path: PathBuf,
     config: RollingClusterTrackerConfig,
     polarity_filter_config: PolarityFilterConfig,
+    background_activity_filter_config: BackgroundActivityFilterConfig,
     static_filter_config: StaticEventFilterConfig,
     format: EventFormat,
     endian: Endian,
@@ -80,7 +85,11 @@ fn track_ball(
     }
 
     let tracker = RollingClusterTracker::new(config)?;
-    let filters = ConfiguredEventFilters::new(polarity_filter_config, static_filter_config)?;
+    let filters = ConfiguredEventFilters::new(
+        polarity_filter_config,
+        background_activity_filter_config,
+        static_filter_config,
+    )?;
     let mut pipeline = EventPipeline::new(opened.stream, filters, tracker);
     let mut event_count = 0_u64;
     let mut detection_count = 0_u64;
@@ -107,8 +116,22 @@ fn track_ball(
 }
 
 fn print_detection(detection: &ClusterDetection) {
+    let circle = detection.circle_fit.map_or_else(
+        || "circle=none".to_owned(),
+        |circle| {
+            format!(
+                "circle=({:.2},{:.2}) r={:.2}px inliers={} ratio={:.3} err={:.2}px",
+                circle.center_x,
+                circle.center_y,
+                circle.radius_px,
+                circle.inlier_count,
+                circle.inlier_ratio,
+                circle.mean_error_px
+            )
+        },
+    );
     println!(
-        "t={}us window={}..{}us centroid=({:.2},{:.2}) bbox=({},{})->({},{}) events={} confidence={:.3}",
+        "t={}us window={}..{}us centroid=({:.2},{:.2}) bbox=({},{})->({},{}) events={} confidence={:.3} {}",
         detection.timestamp_us,
         detection.window_start_us,
         detection.window_end_us,
@@ -120,6 +143,7 @@ fn print_detection(detection: &ClusterDetection) {
         detection.bbox.max_y,
         detection.event_count,
         detection.confidence,
+        circle,
     );
 }
 
@@ -170,6 +194,10 @@ struct TrackingArgs {
     max_bbox_width: Option<u16>,
     #[arg(long)]
     max_bbox_height: Option<u16>,
+    #[arg(long)]
+    no_circle_fit: bool,
+    #[arg(long)]
+    circle_inlier_tolerance_px: Option<f32>,
 }
 
 impl TrackingArgs {
@@ -196,6 +224,12 @@ impl TrackingArgs {
         if let Some(value) = self.max_bbox_height {
             config.max_bbox_height = value;
         }
+        if self.no_circle_fit {
+            config.circle_fit = false;
+        }
+        if let Some(value) = self.circle_inlier_tolerance_px {
+            config.circle_inlier_tolerance_px = value;
+        }
         config
     }
 }
@@ -208,6 +242,16 @@ struct FilterArgs {
     invert_polarity: bool,
     #[arg(long, alias = "no-invert-polarity")]
     raw_polarity: bool,
+    #[arg(long)]
+    filter_background_activity: bool,
+    #[arg(long)]
+    no_filter_background_activity: bool,
+    #[arg(long)]
+    background_radius_px: Option<u16>,
+    #[arg(long)]
+    background_time_window_us: Option<u64>,
+    #[arg(long)]
+    background_cleanup_after_us: Option<u64>,
     #[arg(long)]
     filter_static: bool,
     #[arg(long)]
@@ -231,6 +275,26 @@ impl FilterArgs {
         }
         if self.raw_polarity {
             config.invert_polarity = false;
+        }
+        config
+    }
+
+    fn background_activity_config(&self) -> BackgroundActivityFilterConfig {
+        let mut config = BackgroundActivityFilterConfig::default();
+        if self.filter_background_activity {
+            config.enabled = true;
+        }
+        if self.no_filter_background_activity {
+            config.enabled = false;
+        }
+        if let Some(value) = self.background_radius_px {
+            config.radius_px = value;
+        }
+        if let Some(value) = self.background_time_window_us {
+            config.time_window_us = value;
+        }
+        if let Some(value) = self.background_cleanup_after_us {
+            config.cleanup_after_us = value;
         }
         config
     }
