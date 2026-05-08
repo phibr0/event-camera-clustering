@@ -1,6 +1,8 @@
 pub mod rolling_cluster;
 
-pub use rolling_cluster::{ClusterDetection, RollingClusterTracker, RollingClusterTrackerConfig};
+pub use rolling_cluster::{
+    CircleFit, ClusterDetection, RollingClusterTracker, RollingClusterTrackerConfig,
+};
 
 use crate::Event;
 

@@ -2,6 +2,12 @@ use event_clustering::Event;
 use event_clustering::algorithms::ClusterDetection;
 use std::collections::VecDeque;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RenderEvent {
+    pub(crate) event: Event,
+    pub(crate) accepted: bool,
+}
+
 pub(crate) fn fill_rgb_bytes(buffer: &[u32], bytes: &mut [u8]) {
     for (color, rgb) in buffer.iter().zip(bytes.chunks_exact_mut(3)) {
         rgb[0] = ((color >> 16) & 0xff) as u8;
@@ -14,13 +20,19 @@ pub(crate) fn render_frame(
     buffer: &mut [u32],
     width: usize,
     height: usize,
-    events: &VecDeque<Event>,
+    events: &VecDeque<RenderEvent>,
     detection: Option<&ClusterDetection>,
     invert_polarity: bool,
+    show_filtered_events: bool,
 ) {
     buffer.fill(0x000000);
 
-    for event in events {
+    for render_event in events {
+        if !render_event.accepted && !show_filtered_events {
+            continue;
+        }
+
+        let event = render_event.event;
         let x = usize::from(event.x);
         let y = usize::from(event.y);
         if x >= width || y >= height {
@@ -33,7 +45,13 @@ pub(crate) fn render_frame(
         } else {
             event.polarity
         };
-        buffer[index] = if polarity { 0xffffff } else { 0x3060ff };
+        buffer[index] = if render_event.accepted {
+            if polarity { 0xffffff } else { 0x3060ff }
+        } else if polarity {
+            0x404040
+        } else {
+            0x182040
+        };
     }
 
     if let Some(detection) = detection {
