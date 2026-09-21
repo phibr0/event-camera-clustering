@@ -1,5 +1,6 @@
 mod render;
 mod viewer;
+mod comparison;
 
 use clap::{Args, Parser, ValueEnum};
 use event_clustering::algorithms::{
@@ -9,11 +10,14 @@ use event_clustering::filter::{
     BackgroundActivityFilterConfig, ConfiguredEventFilters, PolarityFilterConfig, PolarityMode,
     StaticEventFilterConfig,
 };
+use event_clustering::parabola::{
+    GravityAxis, ParabolaFitConfig, TwoShotParabolaFitter, parse_calibration_json,
+};
 use event_clustering::parser::{Endian, EventFormat, open_event_stream};
 use event_clustering::pipeline::EventPipeline;
 use std::env;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use viewer::{ViewConfig, view};
 
 fn main() {
@@ -26,11 +30,20 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse_from(normalize_args(env::args().collect()));
     let tracker_config = cli.tracking.tracker_config();
+    let view_config = cli.view.view_config();
+    let mut parabola_config = cli
+        .parabola
+        .parabola_config(view_config.width, view_config.height);
+    apply_calibration_from_project_root(&mut parabola_config);
     let polarity_filter_config = cli.filters.polarity_config();
     let background_activity_filter_config = cli.filters.background_activity_config();
     let static_filter_config = cli.filters.static_config();
     let format = cli.parser.format.unwrap_or_default();
     let endian = cli.parser.endian.unwrap_or(Endian::Little);
+
+    if matches!(cli.command, CommandName::MotionCompare) {
+        return comparison::run(cli.path, cli.motion, format, endian);
+    }
 
     match cli.command {
         CommandName::TrackBall => track_ball(
@@ -39,6 +52,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             polarity_filter_config,
             background_activity_filter_config,
             static_filter_config,
+            parabola_config,
             format,
             endian,
             cli.max_detections,
@@ -49,10 +63,22 @@ fn run() -> Result<(), Box<dyn Error>> {
             polarity_filter_config,
             background_activity_filter_config,
             static_filter_config,
-            cli.view.view_config(),
+            parabola_config,
+            view_config,
             format,
             endian,
         ),
+        CommandName::MotionCompare => unreachable!(),
+    }
+}
+
+fn apply_calibration_from_project_root(config: &mut ParabolaFitConfig) {
+    let path = Path::new("calibration.json");
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    if let Some(calibration) = parse_calibration_json(&contents) {
+        config.apply_calibration(calibration);
     }
 }
 
@@ -60,7 +86,7 @@ fn normalize_args(mut args: Vec<String>) -> Vec<String> {
     if args.len() == 1 {
         args.push("--help".to_owned());
     }
-    if args.len() >= 3 && matches!(args[1].as_str(), "track-ball" | "view") {
+    if args.len() >= 3 && matches!(args[1].as_str(), "track-ball" | "view" | "motion-compare") {
         args.swap(1, 2);
     }
     args
@@ -72,11 +98,15 @@ fn track_ball(
     polarity_filter_config: PolarityFilterConfig,
     background_activity_filter_config: BackgroundActivityFilterConfig,
     static_filter_config: StaticEventFilterConfig,
+    mut parabola_config: ParabolaFitConfig,
     format: EventFormat,
     endian: Endian,
     max_detections: Option<u64>,
 ) -> Result<(), Box<dyn Error>> {
     let opened = open_event_stream(path, format, endian)?;
+    if let (Some(width), Some(height)) = (opened.header.width, opened.header.height) {
+        parabola_config.adjust_default_intrinsics_for_view(640, 480, width, height);
+    }
     if opened.header.evt_version.as_deref() != Some("2.0") && opened.format == EventFormat::Evt2 {
         eprintln!(
             "warning: RAW header evt version is {:?}, decoding as EVT 2.0",
@@ -91,6 +121,7 @@ fn track_ball(
         static_filter_config,
     )?;
     let mut pipeline = EventPipeline::new(opened.stream, filters, tracker);
+    let mut parabola_fitter = TwoShotParabolaFitter::new(parabola_config)?;
     let mut event_count = 0_u64;
     let mut detection_count = 0_u64;
 
@@ -98,7 +129,8 @@ fn track_ball(
         event_count += 1;
         for detection in processed.outputs {
             detection_count += 1;
-            print_detection(&detection);
+            let parabola_fit = parabola_fitter.push_detection(&detection);
+            print_detection(&detection, parabola_fit.as_ref());
             if max_detections.is_some_and(|max| detection_count >= max) {
                 eprintln!("processed_events={event_count} detections={detection_count}");
                 return Ok(());
@@ -108,14 +140,18 @@ fn track_ball(
 
     for detection in pipeline.finish() {
         detection_count += 1;
-        print_detection(&detection);
+        let parabola_fit = parabola_fitter.push_detection(&detection);
+        print_detection(&detection, parabola_fit.as_ref());
     }
 
     eprintln!("processed_events={event_count} detections={detection_count}");
     Ok(())
 }
 
-fn print_detection(detection: &ClusterDetection) {
+fn print_detection(
+    detection: &ClusterDetection,
+    parabola_fit: Option<&event_clustering::parabola::ParabolaFitEstimate>,
+) {
     let circle = detection.circle_fit.map_or_else(
         || "circle=none".to_owned(),
         |circle| {
@@ -130,8 +166,25 @@ fn print_detection(detection: &ClusterDetection) {
             )
         },
     );
+    let parabola = parabola_fit.map_or_else(
+        || "parabola=none".to_owned(),
+        |fit| {
+            format!(
+                "parabola=p({:.2},{:.2},{:.2})m v({:.2},{:.2},{:.2})m/s inliers={}/{} err={:.3}m",
+                fit.initial_position_m[0],
+                fit.initial_position_m[1],
+                fit.initial_position_m[2],
+                fit.initial_velocity_mps[0],
+                fit.initial_velocity_mps[1],
+                fit.initial_velocity_mps[2],
+                fit.inlier_count,
+                fit.total_count,
+                fit.mean_error_m,
+            )
+        },
+    );
     println!(
-        "t={}us window={}..{}us centroid=({:.2},{:.2}) bbox=({},{})->({},{}) events={} confidence={:.3} {}",
+        "t={}us window={}..{}us centroid=({:.2},{:.2}) bbox=({},{})->({},{}) events={} confidence={:.3} {} {}",
         detection.timestamp_us,
         detection.window_start_us,
         detection.window_end_us,
@@ -144,6 +197,7 @@ fn print_detection(detection: &ClusterDetection) {
         detection.event_count,
         detection.confidence,
         circle,
+        parabola,
     );
 }
 
@@ -168,6 +222,12 @@ struct Cli {
     #[command(flatten)]
     view: ViewArgs,
 
+    #[command(flatten)]
+    parabola: ParabolaArgs,
+
+    #[command(flatten)]
+    motion: comparison::MotionArgs,
+
     #[arg(long)]
     max_detections: Option<u64>,
 }
@@ -176,6 +236,7 @@ struct Cli {
 enum CommandName {
     TrackBall,
     View,
+    MotionCompare,
 }
 
 #[derive(Debug, Args)]
@@ -343,6 +404,102 @@ struct ViewArgs {
     events_per_tick: Option<usize>,
 }
 
+#[derive(Debug, Args)]
+struct ParabolaArgs {
+    #[arg(long)]
+    parabola_fit: bool,
+    #[arg(long)]
+    no_parabola_fit: bool,
+    #[arg(long)]
+    parabola_ball_diameter_m: Option<f32>,
+    #[arg(long)]
+    parabola_fx_px: Option<f32>,
+    #[arg(long)]
+    parabola_fy_px: Option<f32>,
+    #[arg(long)]
+    parabola_cx_px: Option<f32>,
+    #[arg(long)]
+    parabola_cy_px: Option<f32>,
+    #[arg(long)]
+    parabola_gravity_mps2: Option<f32>,
+    #[arg(long, value_parser = parse_gravity_axis)]
+    parabola_gravity_axis: Option<GravityAxis>,
+    #[arg(long)]
+    parabola_buffer_len: Option<usize>,
+    #[arg(long)]
+    parabola_min_points: Option<usize>,
+    #[arg(long)]
+    parabola_max_pair_samples: Option<usize>,
+    #[arg(long)]
+    parabola_inlier_threshold_m: Option<f32>,
+    #[arg(long)]
+    parabola_min_inlier_ratio: Option<f32>,
+    #[arg(long)]
+    parabola_min_sample_dt_s: Option<f32>,
+    #[arg(long)]
+    parabola_min_depth_m: Option<f32>,
+    #[arg(long)]
+    parabola_max_depth_m: Option<f32>,
+}
+
+impl ParabolaArgs {
+    fn parabola_config(&self, width: usize, height: usize) -> ParabolaFitConfig {
+        let mut config = ParabolaFitConfig::for_view(width, height);
+        if self.parabola_fit {
+            config.enabled = true;
+        }
+        if self.no_parabola_fit {
+            config.enabled = false;
+        }
+        if let Some(value) = self.parabola_ball_diameter_m {
+            config.ball_diameter_m = value;
+        }
+        if let Some(value) = self.parabola_fx_px {
+            config.focal_length_x_px = value;
+        }
+        if let Some(value) = self.parabola_fy_px {
+            config.focal_length_y_px = value;
+        }
+        if let Some(value) = self.parabola_cx_px {
+            config.principal_x_px = value;
+        }
+        if let Some(value) = self.parabola_cy_px {
+            config.principal_y_px = value;
+        }
+        if let Some(value) = self.parabola_gravity_mps2 {
+            config.gravity_mps2 = value;
+        }
+        if let Some(value) = self.parabola_gravity_axis {
+            config.gravity_axis = value;
+        }
+        if let Some(value) = self.parabola_buffer_len {
+            config.buffer_len = value;
+        }
+        if let Some(value) = self.parabola_min_points {
+            config.min_points = value;
+        }
+        if let Some(value) = self.parabola_max_pair_samples {
+            config.max_pair_samples = value;
+        }
+        if let Some(value) = self.parabola_inlier_threshold_m {
+            config.inlier_threshold_m = value;
+        }
+        if let Some(value) = self.parabola_min_inlier_ratio {
+            config.min_inlier_ratio = value;
+        }
+        if let Some(value) = self.parabola_min_sample_dt_s {
+            config.min_sample_dt_s = value;
+        }
+        if let Some(value) = self.parabola_min_depth_m {
+            config.min_depth_m = value;
+        }
+        if let Some(value) = self.parabola_max_depth_m {
+            config.max_depth_m = value;
+        }
+        config
+    }
+}
+
 impl ViewArgs {
     fn view_config(&self) -> ViewConfig {
         let mut config = ViewConfig::default();
@@ -368,5 +525,17 @@ fn parse_polarity_mode(value: &str) -> Result<PolarityMode, String> {
         "positive" | "on" | "+" => Ok(PolarityMode::Positive),
         "negative" | "off" | "-" => Ok(PolarityMode::Negative),
         _ => Err("--polarity must be all, positive/on/+, or negative/off/-".to_owned()),
+    }
+}
+
+fn parse_gravity_axis(value: &str) -> Result<GravityAxis, String> {
+    match value {
+        "x-positive" | "x+" => Ok(GravityAxis::XPositive),
+        "x-negative" | "x-" => Ok(GravityAxis::XNegative),
+        "y-positive" | "y+" => Ok(GravityAxis::YPositive),
+        "y-negative" | "y-" => Ok(GravityAxis::YNegative),
+        "z-positive" | "z+" => Ok(GravityAxis::ZPositive),
+        "z-negative" | "z-" => Ok(GravityAxis::ZNegative),
+        _ => Err("--parabola-gravity-axis must be x-positive/x+, x-negative/x-, y-positive/y+, y-negative/y-, z-positive/z+, or z-negative/z-".to_owned()),
     }
 }

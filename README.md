@@ -2,6 +2,76 @@
 
 # event-camera-clustering
 
+## IMU motion comparison
+
+Open a synchronized four-panel comparison of a RAW recording and its iPhone IMU CSV:
+
+```bash
+cargo run --release -- motion-compensation/aufnahme_tracking_3.raw motion-compare \
+  --imu motion-compensation/3.csv --start-s 4
+```
+
+The top row shows all events with camera rotation compensation **off / on**.
+The bottom row applies the **same foreground filter** to those two streams.
+Both columns use the same timestamps, lens correction, and brightness scale.
+Candidate moving regions are displayed; this mode does not select only a ball.
+
+The viewer starts paused. Play, step, scrub, change playback speed, and adjust the
+IMU time offset, integration window, motion threshold, minimum region size, and
+mounting rotation. Uncovered IMU intervals are explicitly marked unavailable.
+Backward seeks reread the RAW file. Use a release build for interactive playback.
+
+By default, startup estimates the time offset and the fixed phone-to-camera rotation
+by maximizing event alignment over short windows distributed through the recording.
+It searches +/-4 seconds, tries the 24 proper axis mappings, then refines rotation
+and timing. A weak fit fails with an explanation instead of silently claiming success.
+This assumes the static background dominates and there is sufficiently varied rotation.
+The focus score measures event-image sharpness, **not segmentation accuracy**.
+
+Save and reuse the alignment to avoid repeating the search:
+
+```bash
+cargo run --release -- motion-compensation/aufnahme_tracking_3.raw motion-compare \
+  --imu motion-compensation/3.csv --save-alignment /tmp/recording-3.alignment
+
+cargo run --release -- motion-compensation/aufnahme_tracking_3.raw motion-compare \
+  --imu motion-compensation/3.csv --alignment /tmp/recording-3.alignment --start-s 4
+```
+
+Export a labeled, synchronized MP4 without opening a window (requires `ffmpeg`):
+
+```bash
+cargo run --release -- motion-compensation/aufnahme_tracking_3.raw motion-compare \
+  --imu motion-compensation/3.csv --alignment /tmp/recording-3.alignment \
+  --start-s 4 --end-s 10 --export-mp4 /tmp/motion-comparison.mp4
+```
+
+Outputs are never overwritten. The video contains all four panels and camera time.
+The alignment file contains the offset in seconds on its first line and a row-major
+3x3 IMU-to-camera rotation on the second. The convention is
+`IMU time since first sample = camera time since first event + offset`.
+Each recording can need its own offset. `--motion-offset` and `--imu-to-camera`
+provide manual values; `--auto-align` forces recalibration, and `--alignment-range`
+changes the search radius. The CSV's monotonic `timestamp` and `gx,gy,gz` in rad/s
+are used; packet arrival times and absolute phone orientation are not used.
+
+Default segmentation uses a 30 ms window, 3 px cells, a normalized mean-timestamp
+threshold of 0.12, at least three events per cell, and eight connected cells.
+Tune with `--motion-window-ms`, `--motion-cell-px`, `--motion-threshold`, and
+`--motion-min-cells`. The camera calibration must match the recording resolution.
+
+`src/motion.rs` handles IMU interpolation, gyro integration, undistortion, rotation
+warping, automatic alignment, and foreground masks. Mask indices refer to the input
+events, so consumers can retain their original camera coordinates.
+`src/comparison.rs` supplies recording playback, the comparison UI, and video export.
+
+This compensates **rotation**, not depth-dependent translation/parallax. Static
+edges may remain when the camera translates, and slowly moving objects can be missed.
+Lighting changes are also not distinguished from motion. A 100 Hz IMU cannot resolve
+arbitrarily fast vibration. No extrapolation is used outside IMU coverage or across
+sample gaps longer than 50 ms. Validate foreground retention visually; fewer events
+alone does not mean better detection.
+
 ## Getting started
 
 To make it easy for you to get started with GitLab, here's a list of recommended next steps.
@@ -62,7 +132,7 @@ Use the built-in continuous integration in GitLab.
 - Filtered events: hidden by default, or dim gray/dim blue when `show filtered events` is enabled
 - Bounding box: red
 - Centroid: yellow cross
-- 3D ball view: OpenGL XYZ position and recent trajectory when Ball Projection is enabled; drag to orbit and scroll to zoom
+- 3D ball view: OpenGL XYZ position, recent trajectory, and optional two-shot parabola fit; drag to orbit and scroll to zoom
 
 The left panel contains grouped controls. Hover any control for a short explanation.
 
@@ -111,6 +181,17 @@ This is intended for random sensor noise. The first event in a local burst is su
 - `min events`: how many events are required before a cell can be considered static.
 
 This is intended for background flicker sources, such as stationary LEDs. Moving objects should pass through cells before they become static.
+
+### Two-Shot Parabola
+
+- `enabled`: fit a gravity-constrained 3D parabola directly from cluster bounding-box area.
+- `diameter m`: known real-world ball diameter used for depth from apparent bbox area.
+- `fx px`, `fy px`, `cx px`, `cy px`: camera intrinsics used for raw detection-to-3D reconstruction.
+- `gravity axis`: direction of gravity in camera-space coordinates. Default is `y positive`, matching the referenced UZH RPG project.
+- `inlier m`: 3D residual threshold used to score two-point parabola hypotheses.
+- `buffer pts` and `min pts`: rolling point buffer size and minimum inlier count before reporting a fit.
+
+This path is independent from Ball Projection and does not use the Kalman-smoothed 3D reconstruction. It follows the referenced project's minimal two-point parabola model, then refines the best inliers with least squares.
 
 ### Performance
 
@@ -167,6 +248,15 @@ Print the first 10 detections:
 cargo run -- spinner.raw track-ball --max-detections 10
 ```
 
+Print detections with independent two-shot parabola fitting:
+
+```bash
+cargo run -- spinner.raw track-ball \
+  --parabola-fit \
+  --parabola-ball-diameter-m 0.067 \
+  --parabola-gravity-axis y-positive
+```
+
 Tune text-mode tracking:
 
 ```bash
@@ -214,6 +304,22 @@ cargo run -- spinner.raw track-ball \
 --events-per-tick <n>     worker event budget per UI update, default 5000
 --max-detections <count>  stop text output after this many detections
 --endian <mode>           little, little32, or big; default little
+--parabola-fit            enable independent two-shot parabola fitting
+--no-parabola-fit         disable independent two-shot parabola fitting
+--parabola-ball-diameter-m <m>
+                          real-world ball diameter for bbox-area depth, default 0.067
+--parabola-fx-px <px>     parabola reconstruction focal length x
+--parabola-fy-px <px>     parabola reconstruction focal length y
+--parabola-cx-px <px>     parabola reconstruction principal point x
+--parabola-cy-px <px>     parabola reconstruction principal point y
+--parabola-gravity-axis <axis>
+                          x-positive/x+, x-negative/x-, y-positive/y+, y-negative/y-, z-positive/z+, or z-negative/z-
+--parabola-inlier-threshold-m <m>
+                          3D residual threshold for RANSAC inliers, default 0.25
+--parabola-buffer-len <n> rolling 3D point buffer length, default 50
+--parabola-min-points <n> minimum inliers required for a fit, default 4
+--parabola-max-depth-m <m>
+                          reject reconstructed points beyond this depth, default 30
 ```
 
 ## Parser Notes

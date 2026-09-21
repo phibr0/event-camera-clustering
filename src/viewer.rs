@@ -12,18 +12,28 @@ use event_clustering::filter::{
     BackgroundActivityFilterConfig, ConfiguredEventFilters, PolarityFilterConfig, PolarityMode,
     StaticEventFilterConfig,
 };
+use event_clustering::parabola::{
+    GravityAxis, ParabolaFitConfig, ParabolaFitEstimate, ParabolaPoint3d, TwoShotParabolaFitter,
+    parse_calibration_json, point_from_detection,
+};
 use event_clustering::parser::{
     Endian, EventFormat, EventRecord, open_event_stream, read_event_header,
 };
 use event_clustering::pipeline::EventPipeline;
 use std::collections::VecDeque;
 use std::error::Error;
-use std::path::PathBuf;
+use std::fmt::Write as _;
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
+use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+const VIEWER_SETTINGS_PATH: &str = ".event_clustering_viewer_settings";
+const VIEWER_LOG_PATH: &str = "event_clustering_depth.log";
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ViewConfig {
@@ -50,14 +60,22 @@ pub(crate) fn view(
     polarity_filter_config: PolarityFilterConfig,
     background_activity_filter_config: BackgroundActivityFilterConfig,
     static_filter_config: StaticEventFilterConfig,
+    mut parabola_config: ParabolaFitConfig,
     mut view_config: ViewConfig,
     format: EventFormat,
     endian: Endian,
 ) -> Result<(), Box<dyn Error>> {
+    apply_calibration_from_project_root(&mut parabola_config, &mut view_config);
     let time_range = recording_time_range(&path, format, endian).ok().flatten();
     if view_config.uses_default_size() {
         if let Ok(header) = read_event_header(&path) {
             if let (Some(width), Some(height)) = (header.width, header.height) {
+                parabola_config.adjust_default_intrinsics_for_view(
+                    view_config.width,
+                    view_config.height,
+                    width,
+                    height,
+                );
                 view_config.width = width;
                 view_config.height = height;
             }
@@ -85,6 +103,7 @@ pub(crate) fn view(
                 polarity_filter_config,
                 background_activity_filter_config,
                 static_filter_config,
+                parabola_config,
                 view_config,
                 format,
                 endian,
@@ -94,6 +113,25 @@ pub(crate) fn view(
     )?;
 
     Ok(())
+}
+
+fn apply_calibration_from_project_root(
+    parabola_config: &mut ParabolaFitConfig,
+    view_config: &mut ViewConfig,
+) {
+    let Ok(contents) = std::fs::read_to_string(Path::new("calibration.json")) else {
+        return;
+    };
+    let Some(calibration) = parse_calibration_json(&contents) else {
+        return;
+    };
+    parabola_config.apply_calibration(calibration);
+    if view_config.uses_default_size() {
+        if let (Some(width), Some(height)) = (calibration.image_width, calibration.image_height) {
+            view_config.width = width;
+            view_config.height = height;
+        }
+    }
 }
 
 fn recording_time_range(
@@ -139,6 +177,40 @@ fn format_duration_us(duration_us: u64) -> String {
     format!("{minutes:02}:{seconds:02}.{millis:03}")
 }
 
+fn gravity_axis_label(axis: GravityAxis) -> &'static str {
+    match axis {
+        GravityAxis::XPositive => "x positive",
+        GravityAxis::XNegative => "x negative",
+        GravityAxis::YPositive => "y positive",
+        GravityAxis::YNegative => "y negative",
+        GravityAxis::ZPositive => "z positive",
+        GravityAxis::ZNegative => "z negative",
+    }
+}
+
+fn gravity_axis_value(axis: GravityAxis) -> &'static str {
+    match axis {
+        GravityAxis::XPositive => "x-positive",
+        GravityAxis::XNegative => "x-negative",
+        GravityAxis::YPositive => "y-positive",
+        GravityAxis::YNegative => "y-negative",
+        GravityAxis::ZPositive => "z-positive",
+        GravityAxis::ZNegative => "z-negative",
+    }
+}
+
+fn parse_gravity_axis_value(value: &str) -> Option<GravityAxis> {
+    match value {
+        "x-positive" => Some(GravityAxis::XPositive),
+        "x-negative" => Some(GravityAxis::XNegative),
+        "y-positive" => Some(GravityAxis::YPositive),
+        "y-negative" => Some(GravityAxis::YNegative),
+        "z-positive" => Some(GravityAxis::ZPositive),
+        "z-negative" => Some(GravityAxis::ZNegative),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ViewerControls {
     tracker_config: RollingClusterTrackerConfig,
@@ -146,9 +218,12 @@ struct ViewerControls {
     background_activity_filter_config: BackgroundActivityFilterConfig,
     static_filter_config: StaticEventFilterConfig,
     ball_projection_config: BallProjectionConfig,
+    parabola_config: ParabolaFitConfig,
     view_config: ViewConfig,
     show_filtered_events: bool,
     paused: bool,
+    clip_start_us: u64,
+    clip_end_us: u64,
     restart_generation: u64,
     seek_generation: u64,
     seek_target_us: u64,
@@ -161,7 +236,10 @@ struct ViewerFrame {
     processed_events: u64,
     latest_detection: Option<ClusterDetection>,
     latest_ball_estimate: Option<BallTrackEstimate>,
+    latest_parabola_fit: Option<ParabolaFitEstimate>,
     ball_path: Vec<BallTrackEstimate>,
+    parabola_points: Vec<ParabolaPoint3d>,
+    logs: Vec<String>,
     finished: bool,
     error: Option<String>,
 }
@@ -176,6 +254,7 @@ struct ViewerApp {
     background_activity_filter_config: BackgroundActivityFilterConfig,
     static_filter_config: StaticEventFilterConfig,
     ball_projection_config: BallProjectionConfig,
+    parabola_config: ParabolaFitConfig,
     view_config: ViewConfig,
     show_filtered_events: bool,
     paused: bool,
@@ -187,11 +266,16 @@ struct ViewerApp {
     scrubber_timestamp_us: u64,
     timeline_start_us: u64,
     timeline_end_us: u64,
+    clip_start_us: u64,
+    clip_end_us: u64,
     frame_timestamp_us: u64,
     processed_events: u64,
     latest_detection: Option<ClusterDetection>,
     latest_ball_estimate: Option<BallTrackEstimate>,
+    latest_parabola_fit: Option<ParabolaFitEstimate>,
     ball_path: Vec<BallTrackEstimate>,
+    parabola_points: Vec<ParabolaPoint3d>,
+    logs: Vec<String>,
     ball_3d_view: Arc<Mutex<Ball3dView>>,
     ball_3d_camera: Ball3dCamera,
     finished: bool,
@@ -202,31 +286,48 @@ impl ViewerApp {
     fn new(
         cc: &eframe::CreationContext<'_>,
         path: PathBuf,
-        tracker_config: RollingClusterTrackerConfig,
-        polarity_filter_config: PolarityFilterConfig,
-        background_activity_filter_config: BackgroundActivityFilterConfig,
-        static_filter_config: StaticEventFilterConfig,
-        view_config: ViewConfig,
+        mut tracker_config: RollingClusterTrackerConfig,
+        mut polarity_filter_config: PolarityFilterConfig,
+        mut background_activity_filter_config: BackgroundActivityFilterConfig,
+        mut static_filter_config: StaticEventFilterConfig,
+        mut parabola_config: ParabolaFitConfig,
+        mut view_config: ViewConfig,
         format: EventFormat,
         endian: Endian,
         time_range: Option<(u64, u64)>,
     ) -> Self {
+        let mut show_filtered_events = false;
+        let mut ball_projection_config =
+            BallProjectionConfig::for_view(view_config.width, view_config.height);
+        load_viewer_settings(
+            &mut tracker_config,
+            &mut polarity_filter_config,
+            &mut background_activity_filter_config,
+            &mut static_filter_config,
+            &mut ball_projection_config,
+            &mut parabola_config,
+            &mut view_config,
+            &mut show_filtered_events,
+        );
         let gl = cc
             .gl
             .as_ref()
             .expect("viewer must run with the glow renderer");
-        let ball_projection_config =
-            BallProjectionConfig::for_view(view_config.width, view_config.height);
         let (timeline_start_us, timeline_end_us) = time_range.unwrap_or((0, 0));
+        let clip_start_us = timeline_start_us;
+        let clip_end_us = timeline_end_us;
         let controls = Arc::new(Mutex::new(ViewerControls {
             tracker_config,
             polarity_filter_config,
             background_activity_filter_config,
             static_filter_config,
             ball_projection_config,
+            parabola_config,
             view_config,
-            show_filtered_events: false,
+            show_filtered_events,
             paused: false,
+            clip_start_us,
+            clip_end_us,
             restart_generation: 0,
             seek_generation: 0,
             seek_target_us: timeline_start_us,
@@ -238,7 +339,10 @@ impl ViewerApp {
             processed_events: 0,
             latest_detection: None,
             latest_ball_estimate: None,
+            latest_parabola_fit: None,
             ball_path: Vec::new(),
+            parabola_points: Vec::new(),
+            logs: Vec::new(),
             finished: false,
             error: None,
         }));
@@ -262,8 +366,9 @@ impl ViewerApp {
             background_activity_filter_config,
             static_filter_config,
             ball_projection_config,
+            parabola_config,
             view_config,
-            show_filtered_events: false,
+            show_filtered_events,
             paused: false,
             texture: None,
             rgb_buffer: vec![0; view_config.width * view_config.height * 3],
@@ -273,11 +378,16 @@ impl ViewerApp {
             scrubber_timestamp_us: timeline_start_us,
             timeline_start_us,
             timeline_end_us,
+            clip_start_us,
+            clip_end_us,
             frame_timestamp_us: 0,
             processed_events: 0,
             latest_detection: None,
             latest_ball_estimate: None,
+            latest_parabola_fit: None,
             ball_path: Vec::new(),
+            parabola_points: Vec::new(),
+            logs: Vec::new(),
             ball_3d_view: Arc::new(Mutex::new(Ball3dView::new(gl))),
             ball_3d_camera: Ball3dCamera::default(),
             finished: false,
@@ -288,13 +398,16 @@ impl ViewerApp {
     fn pull_frame(&mut self, ctx: &egui::Context) {
         let frame = self.frame.lock().expect("viewer frame lock poisoned");
         self.frame_timestamp_us = frame.frame_timestamp_us;
-        if !self.paused && frame.frame_timestamp_us >= self.timeline_start_us {
+        if !self.paused && frame.frame_timestamp_us >= self.clip_start_us {
             self.scrubber_timestamp_us = frame.frame_timestamp_us;
         }
         self.processed_events = frame.processed_events;
         self.latest_detection = frame.latest_detection.clone();
         self.latest_ball_estimate = frame.latest_ball_estimate.clone();
+        self.latest_parabola_fit = frame.latest_parabola_fit.clone();
         self.ball_path.clone_from(&frame.ball_path);
+        self.parabola_points.clone_from(&frame.parabola_points);
+        self.logs.clone_from(&frame.logs);
         self.finished = frame.finished;
         self.error = frame.error.clone();
 
@@ -323,9 +436,12 @@ impl ViewerApp {
         controls.background_activity_filter_config = self.background_activity_filter_config;
         controls.static_filter_config = self.static_filter_config;
         controls.ball_projection_config = self.ball_projection_config;
+        controls.parabola_config = self.parabola_config;
         controls.view_config = self.view_config;
         controls.show_filtered_events = self.show_filtered_events;
         controls.paused = self.paused;
+        controls.clip_start_us = self.clip_start_us.min(self.clip_end_us);
+        controls.clip_end_us = self.clip_end_us.max(self.clip_start_us + 1);
         controls.restart_generation = self.restart_generation;
         controls.seek_generation = self.seek_generation;
         controls.seek_target_us = self.scrubber_timestamp_us;
@@ -359,19 +475,54 @@ impl ViewerApp {
                 {
                     self.restart_generation += 1;
                     self.seek_generation = 0;
-                    self.scrubber_timestamp_us = self.timeline_start_us;
+                    self.scrubber_timestamp_us = self.clip_start_us;
                 }
             });
             if self.timeline_end_us > self.timeline_start_us {
+                let mut clip_start_us = self.clip_start_us.clamp(self.timeline_start_us, self.timeline_end_us);
+                let mut clip_end_us = self.clip_end_us.clamp(self.timeline_start_us, self.timeline_end_us);
+                if clip_end_us <= clip_start_us {
+                    clip_end_us = (clip_start_us + 1).min(self.timeline_end_us);
+                }
+                let start_response = ui
+                    .add(
+                        egui::Slider::new(
+                            &mut clip_start_us,
+                            self.timeline_start_us..=self.timeline_end_us,
+                        )
+                        .text("start us"),
+                    )
+                    .on_hover_text("Start timestamp for playback and processing.");
+                if start_response.changed() {
+                    self.clip_start_us = clip_start_us.min(self.clip_end_us.saturating_sub(1));
+                    self.scrubber_timestamp_us = self.scrubber_timestamp_us.max(self.clip_start_us);
+                    self.seek_generation += 1;
+                    self.paused = true;
+                }
+                let end_response = ui
+                    .add(
+                        egui::Slider::new(
+                            &mut clip_end_us,
+                            self.timeline_start_us..=self.timeline_end_us,
+                        )
+                        .text("end us"),
+                    )
+                    .on_hover_text("End timestamp for playback and processing.");
+                if end_response.changed() {
+                    self.clip_end_us = clip_end_us.max(self.clip_start_us + 1);
+                    self.scrubber_timestamp_us = self.scrubber_timestamp_us.min(self.clip_end_us);
+                    self.seek_generation += 1;
+                    self.paused = true;
+                }
                 let mut timestamp_us = self.scrubber_timestamp_us.clamp(
-                    self.timeline_start_us,
-                    self.timeline_end_us,
+                    self.clip_start_us,
+                    self.clip_end_us,
                 );
                 let response = ui
                     .add(
                         egui::Slider::new(
                             &mut timestamp_us,
-                            self.timeline_start_us..=self.timeline_end_us,
+                            self.clip_start_us..=self.clip_end_us,
                         )
                         .text("timeline us"),
                     )
@@ -383,8 +534,8 @@ impl ViewerApp {
                 }
                 ui.label(format!(
                     "{} / {}",
-                    format_duration_us(timestamp_us.saturating_sub(self.timeline_start_us)),
-                    format_duration_us(self.timeline_end_us.saturating_sub(self.timeline_start_us))
+                    format_duration_us(timestamp_us.saturating_sub(self.clip_start_us)),
+                    format_duration_us(self.clip_end_us.saturating_sub(self.clip_start_us))
                 ));
             } else {
                 ui.label(egui::RichText::new("timeline unavailable").weak());
@@ -627,6 +778,111 @@ impl ViewerApp {
         });
 
         ui.group(|ui| {
+            ui.strong("Two-Shot Parabola");
+            ui.checkbox(&mut self.parabola_config.enabled, "enabled")
+                .on_hover_text("Fit a gravity-constrained 3D parabola directly from raw cluster bbox area, independent of the Kalman ball projection.");
+            slider_f32(
+                ui,
+                &mut self.parabola_config.ball_diameter_m,
+                0.01..=0.30,
+                "diameter m",
+                "Known real-world ball diameter used for bbox-area depth reconstruction.",
+            );
+            slider_f32(
+                ui,
+                &mut self.parabola_config.focal_length_x_px,
+                50.0..=5_000.0,
+                "fx px",
+                "Camera focal length in horizontal pixels.",
+            );
+            slider_f32(
+                ui,
+                &mut self.parabola_config.focal_length_y_px,
+                50.0..=5_000.0,
+                "fy px",
+                "Camera focal length in vertical pixels.",
+            );
+            slider_f32(
+                ui,
+                &mut self.parabola_config.principal_x_px,
+                0.0..=self.view_config.width as f32,
+                "cx px",
+                "Optical center x coordinate in pixels.",
+            );
+            slider_f32(
+                ui,
+                &mut self.parabola_config.principal_y_px,
+                0.0..=self.view_config.height as f32,
+                "cy px",
+                "Optical center y coordinate in pixels.",
+            );
+            egui::ComboBox::from_label("gravity axis")
+                .selected_text(gravity_axis_label(self.parabola_config.gravity_axis))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.parabola_config.gravity_axis,
+                        GravityAxis::YPositive,
+                        "y positive",
+                    );
+                    ui.selectable_value(
+                        &mut self.parabola_config.gravity_axis,
+                        GravityAxis::YNegative,
+                        "y negative",
+                    );
+                    ui.selectable_value(
+                        &mut self.parabola_config.gravity_axis,
+                        GravityAxis::ZPositive,
+                        "z positive",
+                    );
+                    ui.selectable_value(
+                        &mut self.parabola_config.gravity_axis,
+                        GravityAxis::ZNegative,
+                        "z negative",
+                    );
+                    ui.selectable_value(
+                        &mut self.parabola_config.gravity_axis,
+                        GravityAxis::XPositive,
+                        "x positive",
+                    );
+                    ui.selectable_value(
+                        &mut self.parabola_config.gravity_axis,
+                        GravityAxis::XNegative,
+                        "x negative",
+                    );
+                })
+                .response
+                .on_hover_text("Direction of gravity in reconstructed camera-space coordinates. Default matches the referenced project: y positive.");
+            slider_f32(
+                ui,
+                &mut self.parabola_config.inlier_threshold_m,
+                0.01..=1.0,
+                "inlier m",
+                "Maximum 3D residual for a point to support a two-shot parabola hypothesis.",
+            );
+            slider_usize(
+                ui,
+                &mut self.parabola_config.buffer_len,
+                2..=200,
+                "buffer pts",
+                "Recent reconstructed points retained for fitting.",
+            );
+            slider_usize(
+                ui,
+                &mut self.parabola_config.min_points,
+                2..=self.parabola_config.buffer_len.max(2),
+                "min pts",
+                "Minimum inlier points required before reporting a fit.",
+            );
+            slider_f32(
+                ui,
+                &mut self.parabola_config.max_depth_m,
+                1.0..=100.0,
+                "max depth m",
+                "Reject bbox-area reconstructions farther than this before fitting.",
+            );
+        });
+
+        ui.group(|ui| {
             ui.strong("Performance");
             ui.checkbox(&mut self.show_filtered_events, "show filtered events")
                 .on_hover_text("Display rejected events as dim pixels. When disabled, only events accepted by the filters are rendered.");
@@ -690,8 +946,45 @@ impl ViewerApp {
                 ui.separator();
                 ui.label(egui::RichText::new("no ball estimate yet").weak());
             }
+            if let Some(fit) = &self.latest_parabola_fit {
+                ui.separator();
+                ui.label(format!(
+                    "parabola p: {:.2}, {:.2}, {:.2} m",
+                    fit.initial_position_m[0], fit.initial_position_m[1], fit.initial_position_m[2]
+                ));
+                ui.label(format!(
+                    "parabola v: {:.2}, {:.2}, {:.2} m/s",
+                    fit.initial_velocity_mps[0],
+                    fit.initial_velocity_mps[1],
+                    fit.initial_velocity_mps[2]
+                ));
+                ui.label(format!(
+                    "parabola inliers: {}/{} err {:.3} m",
+                    fit.inlier_count, fit.total_count, fit.mean_error_m
+                ));
+            } else if self.parabola_config.enabled {
+                ui.separator();
+                ui.label(egui::RichText::new("no parabola fit yet").weak());
+            }
             if let Some(error) = &self.error {
                 ui.colored_label(egui::Color32::YELLOW, error);
+            }
+        });
+
+        ui.group(|ui| {
+            ui.strong("Logs");
+            if self.logs.is_empty() {
+                ui.label(egui::RichText::new("no logs yet").weak());
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt("viewer_logs_scroll")
+                    .max_height(180.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for entry in &self.logs {
+                            ui.label(egui::RichText::new(entry).monospace().small());
+                        }
+                    });
             }
         });
     }
@@ -723,7 +1016,16 @@ impl ViewerApp {
             }
         }
 
-        let status_text = if let Some(estimate) = &self.latest_ball_estimate {
+        let status_text = if let Some(fit) = &self.latest_parabola_fit {
+            format!(
+                "parabola v={:.2},{:.2},{:.2}m/s  inliers={}/{}",
+                fit.initial_velocity_mps[0],
+                fit.initial_velocity_mps[1],
+                fit.initial_velocity_mps[2],
+                fit.inlier_count,
+                fit.total_count,
+            )
+        } else if let Some(estimate) = &self.latest_ball_estimate {
             format!(
                 "x={:.2}m  y={:.2}m  z={:.2}m  speed={:.2}m/s",
                 estimate.position_m[0],
@@ -731,10 +1033,12 @@ impl ViewerApp {
                 estimate.position_m[2],
                 estimate.speed_mps
             )
+        } else if self.parabola_config.enabled {
+            "No parabola fit yet".to_owned()
         } else if self.ball_projection_config.enabled {
             "No 3D estimate yet".to_owned()
         } else {
-            "Enable Ball Projection to show 3D position".to_owned()
+            "Enable Ball Projection or Two-Shot Parabola to show 3D position".to_owned()
         };
         painter.text(
             rect.left_top() + egui::vec2(10.0, 10.0),
@@ -744,11 +1048,13 @@ impl ViewerApp {
             egui::Color32::WHITE,
         );
 
-        if !self.ball_projection_config.enabled {
+        if !self.ball_projection_config.enabled && !self.parabola_config.enabled {
             return;
         }
 
         let ball_path = self.ball_path.clone();
+        let parabola_points = self.parabola_points.clone();
+        let parabola_fit = self.latest_parabola_fit.clone();
         let camera = self.ball_3d_camera;
         let ball_3d_view = Arc::clone(&self.ball_3d_view);
         let callback = egui::PaintCallback {
@@ -761,6 +1067,8 @@ impl ViewerApp {
                         painter.gl(),
                         rect.width() / rect.height().max(1.0),
                         &ball_path,
+                        &parabola_points,
+                        parabola_fit.as_ref(),
                         camera,
                     );
             })),
@@ -885,11 +1193,19 @@ impl Ball3dView {
         gl: &glow::Context,
         aspect_ratio: f32,
         ball_path: &[BallTrackEstimate],
+        parabola_points: &[ParabolaPoint3d],
+        parabola_fit: Option<&ParabolaFitEstimate>,
         camera: Ball3dCamera,
     ) {
         use glow::HasContext as _;
-        let vertices = ball_scene_vertices(ball_path);
-        let mvp = ball_scene_mvp(ball_path, aspect_ratio, camera);
+        let vertices = ball_scene_vertices(ball_path, parabola_points, parabola_fit);
+        let mvp = ball_scene_mvp(
+            ball_path,
+            parabola_points,
+            parabola_fit,
+            aspect_ratio,
+            camera,
+        );
 
         unsafe {
             gl.enable(glow::BLEND);
@@ -949,8 +1265,12 @@ fn f32s_as_u8s(values: &[f32]) -> &[u8] {
     unsafe { slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
 }
 
-fn ball_scene_vertices(ball_path: &[BallTrackEstimate]) -> Vec<f32> {
-    let extent = ball_scene_extent(ball_path);
+fn ball_scene_vertices(
+    ball_path: &[BallTrackEstimate],
+    parabola_points: &[ParabolaPoint3d],
+    parabola_fit: Option<&ParabolaFitEstimate>,
+) -> Vec<f32> {
+    let extent = ball_scene_extent(ball_path, parabola_points, parabola_fit);
     let mut vertices = Vec::new();
     let grid_color = [0.18, 0.20, 0.24];
     let axis_x = [1.0, 0.25, 0.25];
@@ -958,6 +1278,8 @@ fn ball_scene_vertices(ball_path: &[BallTrackEstimate]) -> Vec<f32> {
     let axis_z = [0.25, 0.55, 1.0];
     let path_color = [0.25, 0.75, 1.0];
     let ball_color = [1.0, 0.88, 0.15];
+    let parabola_point_color = [1.0, 0.55, 0.15];
+    let parabola_curve_color = [0.2, 1.0, 0.35];
     let grid_step = (extent / 4.0).max(0.25);
 
     for index in -4..=4 {
@@ -982,6 +1304,34 @@ fn ball_scene_vertices(ball_path: &[BallTrackEstimate]) -> Vec<f32> {
             segment[1].position_m,
             path_color,
         );
+    }
+
+    for point in parabola_points {
+        let radius = 0.035;
+        let p = point.position_m;
+        push_line(
+            &mut vertices,
+            [p[0] - radius, p[1], p[2]],
+            [p[0] + radius, p[1], p[2]],
+            parabola_point_color,
+        );
+        push_line(
+            &mut vertices,
+            [p[0], p[1] - radius, p[2]],
+            [p[0], p[1] + radius, p[2]],
+            parabola_point_color,
+        );
+    }
+
+    if let Some(fit) = parabola_fit {
+        let duration_s = parabola_duration_s(fit).clamp(0.2, 2.0);
+        let mut previous = fit.sample_at_s(0.0);
+        for index in 1..=48 {
+            let t = duration_s * index as f32 / 48.0;
+            let current = fit.sample_at_s(t);
+            push_line(&mut vertices, previous, current, parabola_curve_color);
+            previous = current;
+        }
     }
 
     if let Some(estimate) = ball_path.last() {
@@ -1017,11 +1367,15 @@ fn push_line(vertices: &mut Vec<f32>, a: [f32; 3], b: [f32; 3], color: [f32; 3])
 
 fn ball_scene_mvp(
     ball_path: &[BallTrackEstimate],
+    parabola_points: &[ParabolaPoint3d],
+    parabola_fit: Option<&ParabolaFitEstimate>,
     aspect_ratio: f32,
     camera: Ball3dCamera,
 ) -> [f32; 16] {
-    let target = ball_scene_center(ball_path);
-    let distance = camera.distance.max(ball_scene_extent(ball_path) * 1.25);
+    let target = ball_scene_center(ball_path, parabola_points, parabola_fit);
+    let distance = camera
+        .distance
+        .max(ball_scene_extent(ball_path, parabola_points, parabola_fit) * 1.25);
     let eye = [
         target[0] + distance * camera.yaw.sin() * camera.pitch.cos(),
         target[1] + distance * camera.pitch.sin(),
@@ -1032,17 +1386,31 @@ fn ball_scene_mvp(
     mat4_mul(projection, view)
 }
 
-fn ball_scene_center(ball_path: &[BallTrackEstimate]) -> [f32; 3] {
-    if ball_path.is_empty() {
+fn ball_scene_center(
+    ball_path: &[BallTrackEstimate],
+    parabola_points: &[ParabolaPoint3d],
+    parabola_fit: Option<&ParabolaFitEstimate>,
+) -> [f32; 3] {
+    if ball_path.is_empty() && parabola_points.is_empty() && parabola_fit.is_none() {
         return [0.0, 0.0, 1.0];
     }
 
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
     for estimate in ball_path {
-        for axis in 0..3 {
-            min[axis] = min[axis].min(estimate.position_m[axis]);
-            max[axis] = max[axis].max(estimate.position_m[axis]);
+        include_point_bounds(estimate.position_m, &mut min, &mut max);
+    }
+    for point in parabola_points {
+        include_point_bounds(point.position_m, &mut min, &mut max);
+    }
+    if let Some(fit) = parabola_fit {
+        let duration_s = parabola_duration_s(fit).clamp(0.2, 2.0);
+        for index in 0..=12 {
+            include_point_bounds(
+                fit.sample_at_s(duration_s * index as f32 / 12.0),
+                &mut min,
+                &mut max,
+            );
         }
     }
 
@@ -1053,13 +1421,49 @@ fn ball_scene_center(ball_path: &[BallTrackEstimate]) -> [f32; 3] {
     ]
 }
 
-fn ball_scene_extent(ball_path: &[BallTrackEstimate]) -> f32 {
-    ball_path
-        .iter()
-        .flat_map(|estimate| estimate.position_m)
-        .map(f32::abs)
-        .fold(1.0_f32, f32::max)
-        .max(1.0)
+fn ball_scene_extent(
+    ball_path: &[BallTrackEstimate],
+    parabola_points: &[ParabolaPoint3d],
+    parabola_fit: Option<&ParabolaFitEstimate>,
+) -> f32 {
+    let mut extent = 1.0_f32;
+    for estimate in ball_path {
+        extent = extent.max(
+            estimate
+                .position_m
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0, f32::max),
+        );
+    }
+    for point in parabola_points {
+        extent = extent.max(
+            point
+                .position_m
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0, f32::max),
+        );
+    }
+    if let Some(fit) = parabola_fit {
+        let duration_s = parabola_duration_s(fit).clamp(0.2, 2.0);
+        for index in 0..=12 {
+            let sample = fit.sample_at_s(duration_s * index as f32 / 12.0);
+            extent = extent.max(sample.iter().map(|value| value.abs()).fold(0.0, f32::max));
+        }
+    }
+    extent.max(1.0)
+}
+
+fn include_point_bounds(point: [f32; 3], min: &mut [f32; 3], max: &mut [f32; 3]) {
+    for axis in 0..3 {
+        min[axis] = min[axis].min(point[axis]);
+        max[axis] = max[axis].max(point[axis]);
+    }
+}
+
+fn parabola_duration_s(fit: &ParabolaFitEstimate) -> f32 {
+    fit.timestamp_us.saturating_sub(fit.origin_timestamp_us) as f32 / 1_000_000.0 + 0.5
 }
 
 fn perspective(fov_y_rad: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
@@ -1209,8 +1613,306 @@ fn slider_f32(
         .on_hover_text(tooltip);
 }
 
+fn load_viewer_settings(
+    tracker: &mut RollingClusterTrackerConfig,
+    polarity: &mut PolarityFilterConfig,
+    background: &mut BackgroundActivityFilterConfig,
+    static_filter: &mut StaticEventFilterConfig,
+    ball: &mut BallProjectionConfig,
+    parabola: &mut ParabolaFitConfig,
+    view: &mut ViewConfig,
+    show_filtered_events: &mut bool,
+) {
+    let Ok(contents) = std::fs::read_to_string(VIEWER_SETTINGS_PATH) else {
+        return;
+    };
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "view.width" => set_parsed(value, &mut view.width),
+            "view.height" => set_parsed(value, &mut view.height),
+            "view.speed" => set_parsed(value, &mut view.speed),
+            "view.events_per_tick" => set_parsed(value, &mut view.max_events_per_ui_update),
+            "show_filtered_events" => set_parsed(value, show_filtered_events),
+            "tracker.window_us" => set_parsed(value, &mut tracker.window_us),
+            "tracker.step_us" => set_parsed(value, &mut tracker.step_us),
+            "tracker.cell_size" => set_parsed(value, &mut tracker.cell_size),
+            "tracker.min_events" => set_parsed(value, &mut tracker.min_events),
+            "tracker.min_cells" => set_parsed(value, &mut tracker.min_cells),
+            "tracker.max_bbox_width" => set_parsed(value, &mut tracker.max_bbox_width),
+            "tracker.max_bbox_height" => set_parsed(value, &mut tracker.max_bbox_height),
+            "tracker.circle_fit" => set_parsed(value, &mut tracker.circle_fit),
+            "tracker.circle_inlier_tolerance_px" => {
+                set_parsed(value, &mut tracker.circle_inlier_tolerance_px)
+            }
+            "polarity.mode" => {
+                polarity.mode = match value {
+                    "positive" => PolarityMode::Positive,
+                    "negative" => PolarityMode::Negative,
+                    _ => PolarityMode::All,
+                };
+            }
+            "polarity.invert" => set_parsed(value, &mut polarity.invert_polarity),
+            "background.enabled" => set_parsed(value, &mut background.enabled),
+            "background.radius_px" => set_parsed(value, &mut background.radius_px),
+            "background.time_window_us" => set_parsed(value, &mut background.time_window_us),
+            "static.enabled" => set_parsed(value, &mut static_filter.enabled),
+            "static.cell_size" => set_parsed(value, &mut static_filter.cell_size),
+            "static.stable_after_us" => set_parsed(value, &mut static_filter.stable_after_us),
+            "static.min_events" => set_parsed(value, &mut static_filter.min_events),
+            "ball.enabled" => set_parsed(value, &mut ball.enabled),
+            "ball.diameter_m" => set_parsed(value, &mut ball.diameter_m),
+            "ball.fx_px" => set_parsed(value, &mut ball.focal_length_x_px),
+            "ball.fy_px" => set_parsed(value, &mut ball.focal_length_y_px),
+            "ball.cx_px" => set_parsed(value, &mut ball.principal_x_px),
+            "ball.cy_px" => set_parsed(value, &mut ball.principal_y_px),
+            "ball.diameter_source" => {
+                ball.diameter_source = match value {
+                    "bbox-width" => BallDiameterSource::BboxWidth,
+                    "bbox-height" => BallDiameterSource::BboxHeight,
+                    "bbox-average" => BallDiameterSource::BboxAverage,
+                    "bbox-max" => BallDiameterSource::BboxMax,
+                    "bbox-min" => BallDiameterSource::BboxMin,
+                    _ => BallDiameterSource::CircleFit,
+                };
+            }
+            "parabola.enabled" => set_parsed(value, &mut parabola.enabled),
+            "parabola.ball_diameter_m" => set_parsed(value, &mut parabola.ball_diameter_m),
+            "parabola.fx_px" => set_parsed(value, &mut parabola.focal_length_x_px),
+            "parabola.fy_px" => set_parsed(value, &mut parabola.focal_length_y_px),
+            "parabola.cx_px" => set_parsed(value, &mut parabola.principal_x_px),
+            "parabola.cy_px" => set_parsed(value, &mut parabola.principal_y_px),
+            "parabola.gravity_axis" => {
+                if let Some(axis) = parse_gravity_axis_value(value) {
+                    parabola.gravity_axis = axis;
+                }
+            }
+            "parabola.inlier_threshold_m" => set_parsed(value, &mut parabola.inlier_threshold_m),
+            "parabola.buffer_len" => set_parsed(value, &mut parabola.buffer_len),
+            "parabola.min_points" => set_parsed(value, &mut parabola.min_points),
+            "parabola.max_depth_m" => set_parsed(value, &mut parabola.max_depth_m),
+            _ => {}
+        }
+    }
+}
+
+fn save_viewer_settings(app: &ViewerApp) {
+    let mut contents = String::new();
+    let polarity_mode = match app.polarity_filter_config.mode {
+        PolarityMode::All => "all",
+        PolarityMode::Positive => "positive",
+        PolarityMode::Negative => "negative",
+    };
+    let diameter_source = match app.ball_projection_config.diameter_source {
+        BallDiameterSource::CircleFit => "circle-fit",
+        BallDiameterSource::BboxWidth => "bbox-width",
+        BallDiameterSource::BboxHeight => "bbox-height",
+        BallDiameterSource::BboxAverage => "bbox-average",
+        BallDiameterSource::BboxMax => "bbox-max",
+        BallDiameterSource::BboxMin => "bbox-min",
+    };
+    let _ = writeln!(contents, "view.width={}", app.view_config.width);
+    let _ = writeln!(contents, "view.height={}", app.view_config.height);
+    let _ = writeln!(contents, "view.speed={}", app.view_config.speed);
+    let _ = writeln!(
+        contents,
+        "view.events_per_tick={}",
+        app.view_config.max_events_per_ui_update
+    );
+    let _ = writeln!(
+        contents,
+        "show_filtered_events={}",
+        app.show_filtered_events
+    );
+    let _ = writeln!(
+        contents,
+        "tracker.window_us={}",
+        app.tracker_config.window_us
+    );
+    let _ = writeln!(contents, "tracker.step_us={}", app.tracker_config.step_us);
+    let _ = writeln!(
+        contents,
+        "tracker.cell_size={}",
+        app.tracker_config.cell_size
+    );
+    let _ = writeln!(
+        contents,
+        "tracker.min_events={}",
+        app.tracker_config.min_events
+    );
+    let _ = writeln!(
+        contents,
+        "tracker.min_cells={}",
+        app.tracker_config.min_cells
+    );
+    let _ = writeln!(
+        contents,
+        "tracker.max_bbox_width={}",
+        app.tracker_config.max_bbox_width
+    );
+    let _ = writeln!(
+        contents,
+        "tracker.max_bbox_height={}",
+        app.tracker_config.max_bbox_height
+    );
+    let _ = writeln!(
+        contents,
+        "tracker.circle_fit={}",
+        app.tracker_config.circle_fit
+    );
+    let _ = writeln!(
+        contents,
+        "tracker.circle_inlier_tolerance_px={}",
+        app.tracker_config.circle_inlier_tolerance_px
+    );
+    let _ = writeln!(contents, "polarity.mode={polarity_mode}");
+    let _ = writeln!(
+        contents,
+        "polarity.invert={}",
+        app.polarity_filter_config.invert_polarity
+    );
+    let _ = writeln!(
+        contents,
+        "background.enabled={}",
+        app.background_activity_filter_config.enabled
+    );
+    let _ = writeln!(
+        contents,
+        "background.radius_px={}",
+        app.background_activity_filter_config.radius_px
+    );
+    let _ = writeln!(
+        contents,
+        "background.time_window_us={}",
+        app.background_activity_filter_config.time_window_us
+    );
+    let _ = writeln!(
+        contents,
+        "static.enabled={}",
+        app.static_filter_config.enabled
+    );
+    let _ = writeln!(
+        contents,
+        "static.cell_size={}",
+        app.static_filter_config.cell_size
+    );
+    let _ = writeln!(
+        contents,
+        "static.stable_after_us={}",
+        app.static_filter_config.stable_after_us
+    );
+    let _ = writeln!(
+        contents,
+        "static.min_events={}",
+        app.static_filter_config.min_events
+    );
+    let _ = writeln!(
+        contents,
+        "ball.enabled={}",
+        app.ball_projection_config.enabled
+    );
+    let _ = writeln!(
+        contents,
+        "ball.diameter_m={}",
+        app.ball_projection_config.diameter_m
+    );
+    let _ = writeln!(
+        contents,
+        "ball.fx_px={}",
+        app.ball_projection_config.focal_length_x_px
+    );
+    let _ = writeln!(
+        contents,
+        "ball.fy_px={}",
+        app.ball_projection_config.focal_length_y_px
+    );
+    let _ = writeln!(
+        contents,
+        "ball.cx_px={}",
+        app.ball_projection_config.principal_x_px
+    );
+    let _ = writeln!(
+        contents,
+        "ball.cy_px={}",
+        app.ball_projection_config.principal_y_px
+    );
+    let _ = writeln!(contents, "ball.diameter_source={diameter_source}");
+    let _ = writeln!(contents, "parabola.enabled={}", app.parabola_config.enabled);
+    let _ = writeln!(
+        contents,
+        "parabola.ball_diameter_m={}",
+        app.parabola_config.ball_diameter_m
+    );
+    let _ = writeln!(
+        contents,
+        "parabola.fx_px={}",
+        app.parabola_config.focal_length_x_px
+    );
+    let _ = writeln!(
+        contents,
+        "parabola.fy_px={}",
+        app.parabola_config.focal_length_y_px
+    );
+    let _ = writeln!(
+        contents,
+        "parabola.cx_px={}",
+        app.parabola_config.principal_x_px
+    );
+    let _ = writeln!(
+        contents,
+        "parabola.cy_px={}",
+        app.parabola_config.principal_y_px
+    );
+    let _ = writeln!(
+        contents,
+        "parabola.gravity_axis={}",
+        gravity_axis_value(app.parabola_config.gravity_axis)
+    );
+    let _ = writeln!(
+        contents,
+        "parabola.inlier_threshold_m={}",
+        app.parabola_config.inlier_threshold_m
+    );
+    let _ = writeln!(
+        contents,
+        "parabola.buffer_len={}",
+        app.parabola_config.buffer_len
+    );
+    let _ = writeln!(
+        contents,
+        "parabola.min_points={}",
+        app.parabola_config.min_points
+    );
+    let _ = writeln!(
+        contents,
+        "parabola.max_depth_m={}",
+        app.parabola_config.max_depth_m
+    );
+    let _ = std::fs::write(VIEWER_SETTINGS_PATH, contents);
+}
+
+fn set_parsed<T: std::str::FromStr>(value: &str, target: &mut T) {
+    if let Ok(parsed) = value.parse() {
+        *target = parsed;
+    }
+}
+
+fn append_log_entry(entry: &str) {
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(VIEWER_LOG_PATH)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{entry}");
+}
+
 impl Drop for ViewerApp {
     fn drop(&mut self) {
+        save_viewer_settings(self);
         self.stop_worker.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -1224,17 +1926,55 @@ impl eframe::App for ViewerApp {
         self.push_controls();
         self.pull_frame(&ctx);
 
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(260.0, ui.available_height()),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.set_width(260.0);
-                    self.ui_controls(ui);
-                },
-            );
-            ui.separator();
-            ui.vertical(|ui| {
+        let rect = ui.available_rect_before_wrap();
+        let controls_width = 300.0;
+        let separator_width = 1.0;
+        let gutter = 10.0;
+        let controls_rect = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(
+                (rect.left() + controls_width).min(rect.right()),
+                rect.bottom(),
+            ),
+        );
+        let separator_x = controls_rect.right() + gutter * 0.5;
+        let content_rect = egui::Rect::from_min_max(
+            egui::pos2((separator_x + gutter).min(rect.right()), rect.top()),
+            rect.max,
+        );
+
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(controls_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+            |ui| {
+                ui.set_width(controls_rect.width());
+                ui.set_height(controls_rect.height());
+                egui::ScrollArea::vertical()
+                    .id_salt("viewer_controls_scroll")
+                    .auto_shrink([false, false])
+                    .max_height(controls_rect.height())
+                    .show(ui, |ui| {
+                        ui.set_width(controls_rect.width() - 12.0);
+                        self.ui_controls(ui);
+                    });
+            },
+        );
+
+        ui.painter().vline(
+            separator_x,
+            rect.y_range(),
+            egui::Stroke::new(
+                separator_width,
+                ui.visuals().widgets.noninteractive.bg_stroke.color,
+            ),
+        );
+
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(content_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+            |ui| {
                 egui::Frame::canvas(ui.style()).show(ui, |ui| {
                     if let Some(texture) = &self.texture {
                         ui.image((
@@ -1255,8 +1995,10 @@ impl eframe::App for ViewerApp {
                 egui::Frame::canvas(ui.style()).show(ui, |ui| {
                     self.ui_3d_view(ui);
                 });
-            });
-        });
+            },
+        );
+
+        ui.allocate_rect(rect, egui::Sense::hover());
 
         ctx.request_repaint_after(Duration::from_millis(1));
     }
@@ -1295,10 +2037,14 @@ struct WorkerState {
     frame: Arc<Mutex<ViewerFrame>>,
     pipeline: Option<EventPipeline<ConfiguredEventFilters, RollingClusterTracker>>,
     ball_estimator: Option<BallPathEstimator>,
+    parabola_fitter: Option<TwoShotParabolaFitter>,
     render_events: VecDeque<RenderEvent>,
     latest_detection: Option<ClusterDetection>,
     latest_ball_estimate: Option<BallTrackEstimate>,
+    latest_parabola_fit: Option<ParabolaFitEstimate>,
     ball_path: VecDeque<BallTrackEstimate>,
+    parabola_points: VecDeque<ParabolaPoint3d>,
+    logs: VecDeque<String>,
     buffer: Vec<u32>,
     rgb_buffer: Vec<u8>,
     next_frame_us: Option<u64>,
@@ -1330,10 +2076,14 @@ impl WorkerState {
             frame,
             pipeline: None,
             ball_estimator: None,
+            parabola_fitter: None,
             render_events: VecDeque::new(),
             latest_detection: None,
             latest_ball_estimate: None,
+            latest_parabola_fit: None,
             ball_path: VecDeque::new(),
+            parabola_points: VecDeque::new(),
+            logs: VecDeque::new(),
             buffer: vec![
                 0;
                 controls_snapshot.view_config.width * controls_snapshot.view_config.height
@@ -1384,14 +2134,18 @@ impl WorkerState {
     fn reset_stream(&mut self, controls: ViewerControls) {
         self.pipeline = None;
         self.ball_estimator = None;
+        self.parabola_fitter = None;
         self.render_events.clear();
         self.latest_detection = None;
         self.latest_ball_estimate = None;
+        self.latest_parabola_fit = None;
         self.ball_path.clear();
+        self.parabola_points.clear();
+        self.logs.clear();
         self.next_frame_us = None;
         self.playback_start_us = None;
         self.playback_start = Instant::now();
-        self.frame_timestamp_us = 0;
+        self.frame_timestamp_us = controls.clip_start_us;
         self.processed_events = 0;
         self.finished = false;
         self.error = None;
@@ -1420,12 +2174,17 @@ impl WorkerState {
                     ),
                     RollingClusterTracker::new(controls.tracker_config),
                     BallPathEstimator::new(controls.ball_projection_config),
+                    TwoShotParabolaFitter::new(controls.parabola_config),
                 ) {
-                    (Ok(filters), Ok(tracker), Ok(ball_estimator)) => {
+                    (Ok(filters), Ok(tracker), Ok(ball_estimator), Ok(parabola_fitter)) => {
                         self.pipeline = Some(EventPipeline::new(opened.stream, filters, tracker));
                         self.ball_estimator = Some(ball_estimator);
+                        self.parabola_fitter = Some(parabola_fitter);
                     }
-                    (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                    (Err(error), _, _, _)
+                    | (_, Err(error), _, _)
+                    | (_, _, Err(error), _)
+                    | (_, _, _, Err(error)) => {
                         self.error = Some(error.to_string());
                         self.finished = true;
                     }
@@ -1458,6 +2217,7 @@ impl WorkerState {
     }
 
     fn seek_to(&mut self, controls: ViewerControls, target_us: u64) {
+        let target_us = target_us.clamp(controls.clip_start_us, controls.clip_end_us);
         self.reset_stream(controls);
         while !self.finished {
             let Some(event) = self.process_one_event(controls) else {
@@ -1504,6 +2264,18 @@ impl WorkerState {
                 self.ball_path.clear();
             }
         }
+        if let Some(parabola_fitter) = self.parabola_fitter.as_mut() {
+            if let Err(error) = parabola_fitter.set_config(controls.parabola_config) {
+                self.error = Some(error.to_string());
+                self.finished = true;
+                return None;
+            }
+            if !controls.parabola_config.enabled {
+                self.latest_parabola_fit = None;
+                self.parabola_points.clear();
+                parabola_fitter.reset();
+            }
+        }
 
         let processed = match pipeline.next_event() {
             Ok(Some(processed)) => processed,
@@ -1518,8 +2290,17 @@ impl WorkerState {
             }
         };
 
-        self.processed_events += 1;
         let event = processed.event;
+        if event.timestamp_us < controls.clip_start_us {
+            return Some(event);
+        }
+        if event.timestamp_us > controls.clip_end_us {
+            self.frame_timestamp_us = controls.clip_end_us;
+            self.finished = true;
+            return None;
+        }
+
+        self.processed_events += 1;
         self.render_events.push_back(RenderEvent {
             event,
             accepted: processed.accepted,
@@ -1531,6 +2312,21 @@ impl WorkerState {
         );
 
         for detection in processed.outputs {
+            if let Some(point) = point_from_detection(&detection, controls.parabola_config) {
+                self.push_log(format!(
+                    "{} depth={:.3}m centroid=({:.1},{:.1}) bbox={}x{}",
+                    format_duration_us(
+                        detection
+                            .timestamp_us
+                            .saturating_sub(controls.clip_start_us)
+                    ),
+                    point.position_m[2],
+                    detection.centroid_x,
+                    detection.centroid_y,
+                    detection.bbox.width(),
+                    detection.bbox.height(),
+                ));
+            }
             if let Some(ball_estimator) = self.ball_estimator.as_mut() {
                 self.latest_ball_estimate = ball_estimator.estimate(&detection);
                 if let Some(estimate) = &self.latest_ball_estimate {
@@ -1540,10 +2336,22 @@ impl WorkerState {
                     }
                 }
             }
+            if let Some(parabola_fitter) = self.parabola_fitter.as_mut() {
+                self.latest_parabola_fit = parabola_fitter.push_detection(&detection);
+                self.parabola_points = parabola_fitter.points().iter().copied().collect();
+            }
             self.latest_detection = Some(detection);
         }
 
         Some(event)
+    }
+
+    fn push_log(&mut self, entry: String) {
+        append_log_entry(&entry);
+        self.logs.push_back(entry);
+        while self.logs.len() > 300 {
+            self.logs.pop_front();
+        }
     }
 
     fn frame_is_due(&self, controls: ViewerControls) -> bool {
@@ -1583,7 +2391,10 @@ impl WorkerState {
         frame.processed_events = self.processed_events;
         frame.latest_detection = self.latest_detection.clone();
         frame.latest_ball_estimate = self.latest_ball_estimate.clone();
+        frame.latest_parabola_fit = self.latest_parabola_fit.clone();
         frame.ball_path = self.ball_path.iter().cloned().collect();
+        frame.parabola_points = self.parabola_points.iter().copied().collect();
+        frame.logs = self.logs.iter().cloned().collect();
         frame.finished = self.finished;
         frame.error = self.error.clone();
     }
