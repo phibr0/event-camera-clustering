@@ -13,6 +13,10 @@
 *.mp4
 *.alignment
 
+# Shared example recordings and alignment profiles
+!/examples/*.raw
+!/examples/*.alignment
+
 # Local application state and OS metadata
 /.event_clustering_viewer_settings
 *.log

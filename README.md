@@ -6,15 +6,21 @@ IMU rotation compensation, and foreground detection.
 ## Build and run
 
 Use a current stable Rust toolchain. Run commands from the repository root.
-MP4 export requires `ffmpeg` on `PATH`. Recordings and camera calibration are local
-inputs and are not included in Git.
+MP4 export requires `ffmpeg` on `PATH`. Install [Git LFS](https://git-lfs.com/)
+to download the example recordings after cloning:
 
 ```sh
+git lfs install
+git lfs pull
 cargo build --release --locked
-cargo run --release -- spinner.raw view
-cargo run --release -- spinner.raw track-ball --max-detections 10
+cargo run --release -- examples/ball_klein_3.raw view
+cargo run --release -- examples/ball_klein_3.raw track-ball --max-detections 10
 cargo run --release -- --help
 ```
+
+`examples/` contains a 25 cm ball recording (`ball_gross_1`) and a 7 cm ball
+recording (`ball_klein_3`), about 30 MB combined. RAW files use LFS; matching IMU
+CSVs, camera calibration, and estimated alignment profiles use regular Git.
 
 `view` provides playback, a timeline, filter controls, and optional 3D ball
 projection. Hover a control for its description. `track-ball` prints detections.
@@ -47,13 +53,12 @@ the camera. Calibration must match the recording resolution and contain
 `distortion_coefficients` in `[k1,k2,p1,p2,k3]` order. Use `--calibration` to select
 another file.
 
-Estimate and save the time offset and IMU-to-camera rotation:
+Run an example with its saved time offset and IMU-to-camera rotation:
 
 ```sh
-mkdir -p outputs/motion-comparison
-cargo run --release -- motion-compensation/aufnahme_tracking_3.raw motion-compare \
-  --imu motion-compensation/3.csv --start-s 4 \
-  --save-alignment outputs/motion-comparison/recording-3.alignment
+cargo run --release -- examples/ball_klein_3.raw motion-compare \
+  --imu examples/ball_klein_3.csv --calibration examples/calibration.json \
+  --alignment examples/ball_klein_3.alignment --start-s 4
 ```
 
 The viewer starts paused. The top row shows events with rotation compensation
@@ -63,15 +68,20 @@ panels use the same timestamps, lens correction, and brightness scale.
 Reuse the alignment to export a four-panel video:
 
 ```sh
-cargo run --release -- motion-compensation/aufnahme_tracking_3.raw motion-compare \
-  --imu motion-compensation/3.csv \
-  --alignment outputs/motion-comparison/recording-3.alignment \
-  --start-s 4 --end-s 10 --export-mp4 outputs/motion-comparison/recording-3.mp4
+mkdir -p outputs/motion-comparison
+cargo run --release -- examples/ball_klein_3.raw motion-compare \
+  --imu examples/ball_klein_3.csv --calibration examples/calibration.json \
+  --alignment examples/ball_klein_3.alignment \
+  --start-s 4 --end-s 6 --export-mp4 outputs/motion-comparison/ball_klein_3.mp4
 ```
 
 Omit `--export-mp4` to open the viewer. Replace it and its path with `--benchmark`
 to measure contiguous processing windows. Existing MP4 and alignment files are
 not overwritten.
+
+For a new recording, omit `--alignment` and add
+`--save-alignment outputs/motion-comparison/<name>.alignment` to estimate and save
+its alignment. Use calibration for that camera and resolution.
 
 Automatic alignment searches ±4 s and estimates a fixed mounting rotation. It
 requires background structure and varied camera rotation. Weak fits fail. Use
@@ -129,5 +139,6 @@ cargo test --locked
 Git excludes recordings (`*.raw`, root CSVs/ZIPs, `motion-compensation/`),
 `calibration.json`, generated output (`outputs/`, MP4s, alignment profiles), viewer
 settings, logs, OS metadata, and `target/`.
+The recordings, calibration, and alignment profiles in `examples/` are exceptions.
 Keep exports and local diagnostics under `outputs/`. Keep reusable source outside
-that directory. Commit source, `Cargo.toml`, and `Cargo.lock`.
+that directory. Commit source, `.gitattributes`, `Cargo.toml`, and `Cargo.lock`.
