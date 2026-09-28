@@ -13,6 +13,7 @@ use std::{
     io::Write,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::LazyLock,
     time::{Duration, Instant},
 };
 
@@ -50,6 +51,9 @@ pub(crate) struct MotionArgs {
     motion_cell_px: usize,
     #[arg(long, default_value_t = 8)]
     motion_min_cells: usize,
+    /// Minimum fraction of each region outside early activity; 0 restores the mean-time filter.
+    #[arg(long, default_value_t = 0.1)]
+    motion_min_new_fraction: f32,
     #[arg(long, default_value_t = 0.0)]
     start_s: f64,
     #[arg(long)]
@@ -59,6 +63,9 @@ pub(crate) struct MotionArgs {
     export_mp4: Option<PathBuf>,
     #[arg(long, default_value_t = 25)]
     motion_fps: u32,
+    /// Process contiguous windows without playback sleeps; report CPU latency (no video encoder).
+    #[arg(long, conflicts_with = "export_mp4")]
+    benchmark: bool,
 }
 
 fn mount_from_text(text: &str) -> Result<Rotation> {
@@ -101,6 +108,7 @@ pub(crate) fn run(
         || !(0.0..=0.5).contains(&args.motion_threshold)
         || !(1..=16).contains(&args.motion_cell_px)
         || args.motion_min_cells == 0
+        || !(0.0..=1.0).contains(&args.motion_min_new_fraction)
         || !(1..=120).contains(&args.motion_fps)
         || !args.start_s.is_finite()
         || args.start_s < 0.
@@ -111,7 +119,7 @@ pub(crate) fn run(
             .is_some_and(|v| !v.is_finite() || v <= args.start_s)
         || args.motion_offset.is_some_and(|v| !v.is_finite())
     {
-        return Err("invalid motion settings: window 1..200 ms, threshold 0..0.5, cell 1..16 px, positive FPS/interval".into());
+        return Err("invalid motion settings: window 1..200 ms, threshold 0..0.5, cell 1..16 px, new fraction 0..1, positive FPS/interval".into());
     }
     if args.export_mp4.as_ref().is_some_and(|p| p.exists()) {
         return Err("output video already exists; choose a new path".into());
@@ -140,6 +148,7 @@ pub(crate) fn run(
         cell_px: args.motion_cell_px,
         threshold: args.motion_threshold,
         min_component_cells: args.motion_min_cells,
+        min_new_fraction: args.motion_min_new_fraction,
         ..Default::default()
     };
     if let Some(p) = &args.alignment {
@@ -224,7 +233,12 @@ pub(crate) fn run(
         window_us,
         origin_us,
         duration_s,
+        read_ms: 0.,
+        process_ms: 0.,
     };
+    if args.benchmark {
+        return benchmark(engine, start_s, end_s);
+    }
     if let Some(output) = args.export_mp4 {
         return export(engine, start_s, end_s, args.motion_fps, output);
     }
@@ -321,6 +335,7 @@ struct WindowReader {
     pending: Option<Event>,
     events: VecDeque<Event>,
     last_start: u64,
+    last_end: u64,
     origin: u64,
 }
 impl WindowReader {
@@ -334,14 +349,16 @@ impl WindowReader {
             pending: None,
             events: VecDeque::new(),
             last_start: origin,
+            last_end: origin,
             origin,
         })
     }
     fn window(&mut self, start: u64, end: u64) -> Result<Vec<Event>> {
-        if start < self.last_start {
+        if start < self.last_start || end < self.last_end {
             *self = Self::new(self.path.clone(), self.format, self.endian, self.origin)?;
         }
         self.last_start = start;
+        self.last_end = end;
         loop {
             if let Some(e) = self.pending.take() {
                 if e.timestamp_us > end {
@@ -373,12 +390,17 @@ struct Engine {
     window_us: u64,
     origin_us: u64,
     duration_s: f64,
+    read_ms: f64,
+    process_ms: f64,
 }
 impl Engine {
     fn frame(&mut self, time_s: f64) -> Result<(Vec<Event>, MotionFrame)> {
         let end = self.origin_us + (time_s * 1e6).round() as u64;
         let start = end.saturating_sub(self.window_us).max(self.origin_us);
+        let tick = Instant::now();
         let events = self.reader.window(start, end)?;
+        self.read_ms = tick.elapsed().as_secs_f64() * 1000.;
+        let tick = Instant::now();
         let frame = motion::compensate(
             &events,
             self.origin_us,
@@ -388,8 +410,63 @@ impl Engine {
             &self.imu,
             self.config,
         );
+        self.process_ms = tick.elapsed().as_secs_f64() * 1000.;
         Ok((events, frame))
     }
+}
+
+fn benchmark(mut engine: Engine, start_s: f64, end_s: f64) -> Result<()> {
+    let step_s = engine.window_us as f64 * 1e-6;
+    let frames = ((end_s - start_s) / step_s).floor() as usize;
+    if frames < 2 {
+        return Err("benchmark needs at least two complete windows".into());
+    }
+    // Prime the reader at the requested start; exclude disk seek and setup from live latency.
+    let _ = engine.frame(start_s)?;
+    let mut read = Vec::new();
+    let mut process = Vec::new();
+    let mut render = Vec::new();
+    let mut total = Vec::new();
+    let mut events_count = 0usize;
+    for i in 1..=frames {
+        let (events, frame) = engine.frame(start_s + i as f64 * step_s)?;
+        if !frame.imu_covered {
+            return Err("benchmark reached an uncovered IMU interval".into());
+        }
+        events_count += events.len();
+        let tick = Instant::now();
+        std::hint::black_box(panels(&frame, &engine.camera));
+        let render_ms = tick.elapsed().as_secs_f64() * 1000.;
+        read.push(engine.read_ms);
+        process.push(engine.process_ms);
+        render.push(render_ms);
+        total.push(engine.read_ms + engine.process_ms + render_ms);
+    }
+    println!(
+        "{frames} contiguous {:.1} ms windows, {:.2} million events/s of recording",
+        step_s * 1000.,
+        events_count as f64 / (frames as f64 * step_s) / 1e6
+    );
+    for (label, samples) in [
+        ("read", &mut read),
+        ("process (OFF + ON)", &mut process),
+        ("render four panels", &mut render),
+        ("total", &mut total),
+    ] {
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "{label}: p50={:.2} ms p95={:.2} ms max={:.2} ms",
+            samples[samples.len() / 2],
+            samples[(samples.len() * 95 / 100).min(samples.len() - 1)],
+            samples.last().unwrap()
+        );
+    }
+    println!(
+        "Deadline misses: {}/{}; excludes setup, IMU transport, GPU presentation and video encoding",
+        total.iter().filter(|&&ms| ms > step_s * 1000.).count(),
+        frames
+    );
+    Ok(())
 }
 
 const LABELS: [&str; 4] = [
@@ -399,10 +476,16 @@ const LABELS: [&str; 4] = [
     "Foreground | compensation ON",
 ];
 
+// Density is an integer; reuse the same brightness curve for every pixel.
+// The f32 curve has already saturated to 255 by the end of this table.
+static DENSITY_LEVELS: LazyLock<[u8; 256]> =
+    LazyLock::new(|| std::array::from_fn(|n| (255. * (1. - (-(n as f32) / 2.).exp())) as u8));
+
 fn panels(frame: &MotionFrame, camera: &Camera) -> (usize, usize, Vec<Vec<u8>>) {
     let width = camera.width.div_ceil(2);
     let height = camera.height.div_ceil(2);
     let mut output = Vec::new();
+    let levels = &*DENSITY_LEVELS;
     for panel in 0..4 {
         let points = if panel % 2 == 0 {
             &frame.original
@@ -430,7 +513,7 @@ fn panels(frame: &MotionFrame, camera: &Camera) -> (usize, usize, Vec<Vec<u8>>) 
         }
         let mut pixels = vec![0u8; width * height * 3];
         for (n, rgb) in counts.into_iter().zip(pixels.chunks_exact_mut(3)) {
-            let level = (255. * (1. - (-(n as f32) / 2.).exp())) as u8;
+            let level = levels[n.min(255) as usize];
             rgb.copy_from_slice(&[level, level, level]);
         }
         output.push(pixels);
@@ -481,7 +564,7 @@ impl eframe::App for ComparisonApp {
             }
             ui.add(egui::Slider::new(&mut self.speed, 0.1..=2.0).text("speed"));
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("IMU offset (s)");
             self.dirty |= ui
                 .add(
@@ -509,6 +592,13 @@ impl eframe::App for ComparisonApp {
                     egui::Slider::new(&mut self.engine.config.min_component_cells, 1..=100)
                         .text("min cells"),
                 )
+                .changed();
+            self.dirty |= ui
+                .add(
+                    egui::Slider::new(&mut self.engine.config.min_new_fraction, 0.0..=1.0)
+                        .text("min new fraction"),
+                )
+                .on_hover_text("Require some of each region to move beyond early activity. Set 0 for the original filter.")
                 .changed();
         });
         ui.collapsing("Mounting adjustment", |ui| {
@@ -561,11 +651,12 @@ impl eframe::App for ComparisonApp {
                     let after = frame.foreground_on.iter().filter(|v| **v).count();
                     self.status = if frame.imu_covered {
                         format!(
-                            "{} input events · foreground off/on: {} / {} · alignment focus: {:.2}× (not a detection-accuracy score)",
+                            "{} events · foreground off/on: {} / {} · focus: {:.2}× · CPU {:.1} ms",
                             events.len(),
                             before,
                             after,
-                            frame.focus_on / frame.focus_off.max(1.)
+                            frame.focus_on / frame.focus_off.max(1.),
+                            self.engine.process_ms
                         )
                     } else {
                         "NO IMU COVERAGE — compensated foreground unavailable; top-right shows the unwarped input".into()
@@ -679,8 +770,17 @@ fn export(mut engine: Engine, start_s: f64, end_s: f64, fps: u32, path: PathBuf)
                 .enumerate()
                 .map(|(i, s)| (12 + i % 2 * w, 5 + i / 2 * (h + 32), s.to_string()))
                 .collect();
-            labels.push((12,height-27,format!("Time {time:.2}s | rotation only | IMU offset {:+.4}s | foreground OFF / ON: {} / {}",
-                engine.config.offset_s,frame.foreground_off.iter().filter(|v|**v).count(),frame.foreground_on.iter().filter(|v|**v).count())));
+            labels.push((
+                12,
+                height - 27,
+                format!(
+                    "Time {time:.2}s | IMU offset {:+.4}s | min new {:.2} | foreground OFF / ON: {} / {}",
+                    engine.config.offset_s,
+                    engine.config.min_new_fraction,
+                    frame.foreground_off.iter().filter(|v| **v).count(),
+                    frame.foreground_on.iter().filter(|v| **v).count()
+                ),
+            ));
             draw_labels(&text_context, &mut rgb, width, height, &labels);
             input.write_all(&rgb)?;
             if i % fps as usize == 0 {
@@ -777,4 +877,17 @@ fn draw_labels(
         }
     }
     let _ = ctx.end_pass();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn density_lookup_preserves_brightness_curve() {
+        for n in (0..=65_535u32).chain([1_000_000, u32::MAX]) {
+            let expected = (255. * (1. - (-(n as f32) / 2.).exp())) as u8;
+            assert_eq!(DENSITY_LEVELS[n.min(255) as usize], expected, "count {n}");
+        }
+    }
 }

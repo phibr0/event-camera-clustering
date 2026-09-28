@@ -239,6 +239,8 @@ pub struct MotionConfig {
     pub threshold: f32,
     pub min_events: u32,
     pub min_component_cells: usize,
+    /// Fraction of a region that must be outside the early-event neighborhood; 0 disables.
+    pub min_new_fraction: f32,
 }
 
 impl Default for MotionConfig {
@@ -250,6 +252,7 @@ impl Default for MotionConfig {
             threshold: 0.12,
             min_events: 3,
             min_component_cells: 8,
+            min_new_fraction: 0.1,
         }
     }
 }
@@ -347,11 +350,16 @@ fn segment(
     let height = camera.height.div_ceil(cell);
     let mut count = vec![0u32; width * height];
     let mut times = vec![0f32; width * height];
+    let mut early = vec![0u32; width * height];
     let duration = (end_us - start_us).max(1) as f32;
     for (&event, &p) in events.iter().zip(points) {
         if let Some(i) = cell_index(p, camera.width, camera.height, cell) {
             count[i] += 1;
-            times[i] += event.timestamp_us.saturating_sub(start_us) as f32 / duration;
+            let t = event.timestamp_us.saturating_sub(start_us) as f32 / duration;
+            times[i] += t;
+            if config.min_new_fraction > 0. && t < 0.25 {
+                early[i] += 1;
+            }
         }
     }
     let mut mean = 0.;
@@ -369,38 +377,48 @@ fn segment(
     mean /= occupied as f32;
     // ponytail: mean-time residual assumes a dominant static background. Parallax
     // and abrupt illumination can pass; use depth-aware motion if rotation is insufficient.
-    let candidate: Vec<_> = count
+    let mut candidate: Vec<_> = count
         .iter()
         .zip(&times)
         .map(|(&n, &t)| n >= config.min_events && t - mean > config.threshold)
         .collect();
-    let mut visited = vec![false; count.len()];
     let mut keep = vec![false; count.len()];
     let mut component = Vec::new();
     for seed in 0..count.len() {
-        if visited[seed] || !candidate[seed] {
+        if !candidate[seed] {
             continue;
         }
         component.clear();
         component.push(seed);
-        visited[seed] = true;
+        candidate[seed] = false;
         let mut head = 0;
+        let mut new_cells = 0;
         while head < component.len() {
             let i = component[head];
             head += 1;
             let x = i % width;
             let y = i / width;
+            let mut early_support = 0u64;
             for ny in y.saturating_sub(1)..=(y + 1).min(height - 1) {
                 for nx in x.saturating_sub(1)..=(x + 1).min(width - 1) {
                     let j = ny * width + nx;
-                    if candidate[j] && !visited[j] {
-                        visited[j] = true;
+                    early_support += u64::from(early[j]);
+                    if candidate[j] {
+                        candidate[j] = false;
                         component.push(j);
                     }
                 }
             }
+            // Activity split across cell boundaries is still earlier background evidence.
+            new_cells += usize::from(early_support < u64::from(config.min_events));
         }
-        if component.len() >= config.min_component_cells {
+        // A late burst on an already occupied edge is not enough evidence of motion.
+        // Test the whole region so its slower edges survive alongside a moving part.
+        // ponytail: one-cell tolerance suppresses small residual drift but can also
+        // reject slow targets; lower min_new_fraction (0 disables) for that tradeoff.
+        if component.len() >= config.min_component_cells
+            && new_cells as f32 >= component.len() as f32 * config.min_new_fraction
+        {
             for &i in &component {
                 keep[i] = true;
             }
@@ -651,6 +669,82 @@ fn quaternion_matrix(q: [f64; 4]) -> Rotation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn region_motion_check_rejects_repeated_edges_without_eroding_moving_regions() {
+        let camera = Camera::new(
+            CameraCalibration {
+                image_width: Some(96),
+                image_height: Some(72),
+                focal_length_x_px: 80.,
+                focal_length_y_px: 80.,
+                principal_x_px: 48.,
+                principal_y_px: 36.,
+                distortion_coefficients: [0.; 5],
+            },
+            96,
+            72,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        for y in (48..66).step_by(3) {
+            for x in (3..90).step_by(3) {
+                for timestamp_us in [4000, 5000, 6000] {
+                    events.push(Event {
+                        x,
+                        y,
+                        timestamp_us,
+                        polarity: true,
+                    });
+                }
+            }
+        }
+        for y in (0..24).step_by(3) {
+            for repeat in 0..3 {
+                // Sparse early activity straddles the late background cell: no
+                // single early cell reaches min_events. The moving region
+                // has both overlapping and new cells, and should survive intact.
+                for (x, timestamp_us) in [
+                    (if repeat < 2 { 30 } else { 36 }, 1000),
+                    (33, 9000),
+                    (60, 1000),
+                    (if y < 12 { 63 } else { 66 }, 9000),
+                ] {
+                    events.push(Event {
+                        x,
+                        y,
+                        timestamp_us,
+                        polarity: true,
+                    });
+                }
+            }
+        }
+        let points: Vec<_> = events.iter().map(|e| [e.x as f32, e.y as f32]).collect();
+        let baseline = segment(
+            &events,
+            &points,
+            0,
+            10_000,
+            &camera,
+            MotionConfig {
+                min_new_fraction: 0.,
+                ..Default::default()
+            },
+        );
+        let filtered = segment(
+            &events,
+            &points,
+            0,
+            10_000,
+            &camera,
+            MotionConfig::default(),
+        );
+        assert_eq!(baseline.iter().filter(|&&v| v).count(), 48);
+        assert_eq!(filtered.iter().filter(|&&v| v).count(), 24);
+        for (event, &keep) in events.iter().zip(&filtered) {
+            assert_eq!(keep, event.timestamp_us == 9000 && event.x >= 63);
+        }
+    }
 
     #[test]
     fn rotation_compensation_preserves_independent_motion_and_rejects_invalid_imu() {

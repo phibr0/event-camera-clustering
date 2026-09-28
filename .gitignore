@@ -1,3 +1,19 @@
-/target
-/cpp/build
+# Rust build output
+/target/
+
+# Local recordings, measurements, and calibration
 *.raw
+/*.csv
+/*.zip
+/motion-compensation/
+/calibration.json
+
+# Generated videos, plots, alignments, and benchmark reports
+/outputs/
+*.mp4
+*.alignment
+
+# Local application state and OS metadata
+/.event_clustering_viewer_settings
+*.log
+.DS_Store

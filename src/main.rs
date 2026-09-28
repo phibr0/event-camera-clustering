@@ -1,6 +1,6 @@
+mod comparison;
 mod render;
 mod viewer;
-mod comparison;
 
 use clap::{Args, Parser, ValueEnum};
 use event_clustering::algorithms::{

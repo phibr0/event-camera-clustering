@@ -394,7 +394,11 @@ pub fn point_from_detection(
     })
 }
 
-pub(crate) fn undistort_normalized(x_distorted: f32, y_distorted: f32, coeffs: [f32; 5]) -> (f32, f32) {
+pub(crate) fn undistort_normalized(
+    x_distorted: f32,
+    y_distorted: f32,
+    coeffs: [f32; 5],
+) -> (f32, f32) {
     if coeffs.iter().all(|value| value.abs() <= f32::EPSILON) {
         return (x_distorted, y_distorted);
     }
