@@ -11,13 +11,13 @@ use std::{
     error::Error,
     fs,
     io::Write,
-    path::PathBuf,
-    process::{Command, Stdio},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     sync::LazyLock,
     time::{Duration, Instant},
 };
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+pub(crate) type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 #[derive(Debug, Args)]
 pub(crate) struct MotionArgs {
@@ -60,12 +60,12 @@ pub(crate) struct MotionArgs {
     end_s: Option<f64>,
     /// Export a labeled four-panel MP4 instead of opening the viewer; requires ffmpeg.
     #[arg(long)]
-    export_mp4: Option<PathBuf>,
+    pub(crate) export_mp4: Option<PathBuf>,
     #[arg(long, default_value_t = 25)]
-    motion_fps: u32,
+    pub(crate) motion_fps: u32,
     /// Process contiguous windows without playback sleeps; report CPU latency (no video encoder).
     #[arg(long, conflicts_with = "export_mp4")]
-    benchmark: bool,
+    pub(crate) benchmark: bool,
 }
 
 fn mount_from_text(text: &str) -> Result<Rotation> {
@@ -92,38 +92,75 @@ fn mount_from_text(text: &str) -> Result<Rotation> {
     Ok(m)
 }
 
+/// A recording opened with its IMU track, calibration, and alignment.
+pub(crate) struct Session {
+    pub(crate) engine: Engine,
+    /// First and last recording time with a complete window and IMU coverage.
+    pub(crate) start_s: f64,
+    pub(crate) end_s: f64,
+}
+
 pub(crate) fn run(
     path: PathBuf,
     args: MotionArgs,
     format: EventFormat,
     endian: Endian,
 ) -> Result<()> {
+    let Session {
+        engine,
+        start_s,
+        end_s,
+    } = prepare(&path, &args, format, endian)?;
+    let config = engine.config;
+    if args.benchmark {
+        return benchmark(engine, start_s, end_s);
+    }
+    if let Some(output) = args.export_mp4 {
+        return export(engine, start_s, end_s, args.motion_fps, output);
+    }
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Glow,
+        viewport: egui::ViewportBuilder::default().with_inner_size([1360., 1000.]),
+        ..Default::default()
+    };
+    let title = format!(
+        "Motion comparison — {}",
+        path.file_name().unwrap().to_string_lossy()
+    );
+    eframe::run_native(
+        &title,
+        options,
+        Box::new(move |_| {
+            Ok(Box::new(ComparisonApp {
+                engine,
+                time_s: start_s,
+                end_s,
+                paused: true,
+                speed: 0.5,
+                last_tick: Instant::now(),
+                dirty: true,
+                textures: Vec::new(),
+                status: String::new(),
+                error: None,
+                base_mount: config.mount,
+                angles: [0.; 3],
+            }))
+        }),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn prepare(
+    path: &PathBuf,
+    args: &MotionArgs,
+    format: EventFormat,
+    endian: Endian,
+) -> Result<Session> {
     let imu_path = args
         .imu
         .as_ref()
-        .ok_or("motion-compare requires --imu path/to/recording.csv")?;
-    if !args.motion_window_ms.is_finite()
-        || !(1.0..=200.0).contains(&args.motion_window_ms)
-        || !args.motion_threshold.is_finite()
-        || !(0.0..=0.5).contains(&args.motion_threshold)
-        || !(1..=16).contains(&args.motion_cell_px)
-        || args.motion_min_cells == 0
-        || !(0.0..=1.0).contains(&args.motion_min_new_fraction)
-        || !(1..=120).contains(&args.motion_fps)
-        || !args.start_s.is_finite()
-        || args.start_s < 0.
-        || !args.alignment_range.is_finite()
-        || !(0.1..=30.).contains(&args.alignment_range)
-        || args
-            .end_s
-            .is_some_and(|v| !v.is_finite() || v <= args.start_s)
-        || args.motion_offset.is_some_and(|v| !v.is_finite())
-    {
-        return Err("invalid motion settings: window 1..200 ms, threshold 0..0.5, cell 1..16 px, new fraction 0..1, positive FPS/interval".into());
-    }
-    if args.export_mp4.as_ref().is_some_and(|p| p.exists()) {
-        return Err("output video already exists; choose a new path".into());
-    }
+        .ok_or("this command requires --imu path/to/recording.csv")?;
+    validate(args)?;
     if let Some(p) = &args.save_alignment {
         if p.exists() {
             return Err("alignment output already exists; choose a new path".into());
@@ -132,7 +169,7 @@ pub(crate) fn run(
     let imu = ImuTrack::load(imu_path)?;
     let calibration = parse_calibration_json(&fs::read_to_string(&args.calibration)?)
         .ok_or("invalid calibration.json")?;
-    let header = open_event_stream(&path, format, endian)?.header;
+    let header = open_event_stream(path, format, endian)?.header;
     let width = header
         .width
         .or(calibration.image_width)
@@ -143,14 +180,8 @@ pub(crate) fn run(
         .ok_or("recording height unavailable")?;
     let camera = Camera::new(calibration, width, height)?;
     eprintln!("Scanning recording and collecting short calibration windows...");
-    let (origin_us, duration_s, windows) = scan(&path, format, endian)?;
-    let mut config = MotionConfig {
-        cell_px: args.motion_cell_px,
-        threshold: args.motion_threshold,
-        min_component_cells: args.motion_min_cells,
-        min_new_fraction: args.motion_min_new_fraction,
-        ..Default::default()
-    };
+    let (origin_us, duration_s, windows) = scan(path, format, endian)?;
+    let mut config = foreground_config(args);
     if let Some(p) = &args.alignment {
         let text = fs::read_to_string(p)?;
         let mut lines = text.lines();
@@ -225,52 +256,85 @@ pub(crate) fn run(
         return Err("camera and IMU have no overlap at this offset/interval".into());
     }
     let reader = WindowReader::new(path.clone(), format, endian, origin_us)?;
-    let engine = Engine {
-        reader,
-        camera,
-        imu,
-        config,
-        window_us,
-        origin_us,
-        duration_s,
-        read_ms: 0.,
-        process_ms: 0.,
-    };
-    if args.benchmark {
-        return benchmark(engine, start_s, end_s);
+    Ok(Session {
+        engine: Engine {
+            reader,
+            camera,
+            imu,
+            config,
+            window_us,
+            origin_us,
+            duration_s,
+            read_ms: 0.,
+            process_ms: 0.,
+        },
+        start_s,
+        end_s,
+    })
+}
+
+/// What live input needs from the motion options.
+pub(crate) struct LiveSetup {
+    pub(crate) camera: Camera,
+    pub(crate) config: MotionConfig,
+    pub(crate) window_us: u64,
+    /// How long a batch run lasts.
+    pub(crate) duration_s: Option<f64>,
+}
+
+/// Calibration and foreground settings for a camera of the given resolution.
+/// There is no IMU input yet, so the camera is taken to stand still.
+pub(crate) fn live_setup(args: &MotionArgs, width: usize, height: usize) -> Result<LiveSetup> {
+    validate(args)?;
+    if args.imu.is_some() || args.alignment.is_some() {
+        return Err(
+            "live input has no IMU yet: omit --imu and --alignment and keep the camera still"
+                .into(),
+        );
     }
-    if let Some(output) = args.export_mp4 {
-        return export(engine, start_s, end_s, args.motion_fps, output);
-    }
-    let options = eframe::NativeOptions {
-        renderer: eframe::Renderer::Glow,
-        viewport: egui::ViewportBuilder::default().with_inner_size([1360., 1000.]),
+    let calibration = parse_calibration_json(&fs::read_to_string(&args.calibration)?)
+        .ok_or("invalid calibration.json")?;
+    Ok(LiveSetup {
+        camera: Camera::new(calibration, width, height)?,
+        config: foreground_config(args),
+        window_us: (args.motion_window_ms * 1000.).round() as u64,
+        duration_s: args.end_s,
+    })
+}
+
+fn foreground_config(args: &MotionArgs) -> MotionConfig {
+    MotionConfig {
+        cell_px: args.motion_cell_px,
+        threshold: args.motion_threshold,
+        min_component_cells: args.motion_min_cells,
+        min_new_fraction: args.motion_min_new_fraction,
         ..Default::default()
-    };
-    let title = format!(
-        "Motion comparison — {}",
-        path.file_name().unwrap().to_string_lossy()
-    );
-    eframe::run_native(
-        &title,
-        options,
-        Box::new(move |_| {
-            Ok(Box::new(ComparisonApp {
-                engine,
-                time_s: start_s,
-                end_s,
-                paused: true,
-                speed: 0.5,
-                last_tick: Instant::now(),
-                dirty: true,
-                textures: Vec::new(),
-                status: String::new(),
-                error: None,
-                base_mount: config.mount,
-                angles: [0.; 3],
-            }))
-        }),
-    )?;
+    }
+}
+
+fn validate(args: &MotionArgs) -> Result<()> {
+    if !args.motion_window_ms.is_finite()
+        || !(1.0..=200.0).contains(&args.motion_window_ms)
+        || !args.motion_threshold.is_finite()
+        || !(0.0..=0.5).contains(&args.motion_threshold)
+        || !(1..=16).contains(&args.motion_cell_px)
+        || args.motion_min_cells == 0
+        || !(0.0..=1.0).contains(&args.motion_min_new_fraction)
+        || !(1..=120).contains(&args.motion_fps)
+        || !args.start_s.is_finite()
+        || args.start_s < 0.
+        || !args.alignment_range.is_finite()
+        || !(0.1..=30.).contains(&args.alignment_range)
+        || args
+            .end_s
+            .is_some_and(|v| !v.is_finite() || v <= args.start_s)
+        || args.motion_offset.is_some_and(|v| !v.is_finite())
+    {
+        return Err("invalid motion settings: window 1..200 ms, threshold 0..0.5, cell 1..16 px, new fraction 0..1, positive FPS/interval".into());
+    }
+    if args.export_mp4.as_ref().is_some_and(|p| p.exists()) {
+        return Err("output video already exists; choose a new path".into());
+    }
     Ok(())
 }
 
@@ -382,24 +446,30 @@ impl WindowReader {
     }
 }
 
-struct Engine {
+pub(crate) struct Engine {
     reader: WindowReader,
-    camera: Camera,
-    imu: ImuTrack,
-    config: MotionConfig,
-    window_us: u64,
-    origin_us: u64,
-    duration_s: f64,
-    read_ms: f64,
+    pub(crate) camera: Camera,
+    pub(crate) imu: ImuTrack,
+    pub(crate) config: MotionConfig,
+    pub(crate) window_us: u64,
+    pub(crate) origin_us: u64,
+    pub(crate) duration_s: f64,
+    pub(crate) read_ms: f64,
     process_ms: f64,
 }
 impl Engine {
-    fn frame(&mut self, time_s: f64) -> Result<(Vec<Event>, MotionFrame)> {
-        let end = self.origin_us + (time_s * 1e6).round() as u64;
+    /// Events of the window ending at `end` and the window start, both in recording time.
+    pub(crate) fn window(&mut self, end: u64) -> Result<(u64, Vec<Event>)> {
         let start = end.saturating_sub(self.window_us).max(self.origin_us);
         let tick = Instant::now();
         let events = self.reader.window(start, end)?;
         self.read_ms = tick.elapsed().as_secs_f64() * 1000.;
+        Ok((start, events))
+    }
+
+    fn frame(&mut self, time_s: f64) -> Result<(Vec<Event>, MotionFrame)> {
+        let end = self.origin_us + (time_s * 1e6).round() as u64;
+        let (start, events) = self.window(end)?;
         let tick = Instant::now();
         let frame = motion::compensate(
             &events,
@@ -693,13 +763,9 @@ impl eframe::App for ComparisonApp {
     }
 }
 
-fn export(mut engine: Engine, start_s: f64, end_s: f64, fps: u32, path: PathBuf) -> Result<()> {
-    let w = engine.camera.width.div_ceil(2);
-    let h = engine.camera.height.div_ceil(2);
-    let width = (w * 2).next_multiple_of(2);
-    let height = (h * 2 + 96).next_multiple_of(2);
-    let text_context = egui::Context::default();
-    let mut child = Command::new("ffmpeg")
+/// Starts an encoder that reads raw RGB frames from its standard input.
+pub(crate) fn spawn_ffmpeg(width: usize, height: usize, fps: u32, path: &Path) -> Result<Child> {
+    Ok(Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
@@ -727,10 +793,19 @@ fn export(mut engine: Engine, start_s: f64, end_s: f64, fps: u32, path: PathBuf)
             "-movflags",
             "+faststart",
         ])
-        .arg(&path)
+        .arg(path)
         .stdin(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("cannot start ffmpeg for video export: {e}"))?;
+        .map_err(|e| format!("cannot start ffmpeg for video export: {e}"))?)
+}
+
+fn export(mut engine: Engine, start_s: f64, end_s: f64, fps: u32, path: PathBuf) -> Result<()> {
+    let w = engine.camera.width.div_ceil(2);
+    let h = engine.camera.height.div_ceil(2);
+    let width = (w * 2).next_multiple_of(2);
+    let height = (h * 2 + 96).next_multiple_of(2);
+    let text_context = egui::Context::default();
+    let mut child = spawn_ffmpeg(width, height, fps, &path)?;
     let mut input = child.stdin.take().unwrap();
     let mut rgb = vec![0u8; width * height * 3];
     let frames = ((end_s - start_s) * fps as f64).floor() as usize;
@@ -806,7 +881,7 @@ fn export(mut engine: Engine, start_s: f64, end_s: f64, fps: u32, path: PathBuf)
 
 /// Reuse egui's existing font rasterizer for headless video labels. No dependency
 /// on a particular system font or ffmpeg's optional drawtext build feature.
-fn draw_labels(
+pub(crate) fn draw_labels(
     ctx: &egui::Context,
     rgb: &mut [u8],
     width: usize,

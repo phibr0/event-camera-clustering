@@ -17,6 +17,8 @@ fn invalid(message: &'static str) -> EventError {
 pub struct ImuSample {
     pub time_s: f64,
     pub gyro: [f64; 3],
+    /// Direction of gravity in IMU axes, when the CSV provides it.
+    gravity: Option<[f64; 3]>,
     orientation: [f64; 4],
 }
 
@@ -48,20 +50,31 @@ impl ImuTrack {
                 "IMU CSV needs timestamp,gx,gy,gz columns (seconds and rad/s)",
             ));
         };
+        // Optional: the gravity vector of the sensor fusion, any unit, pointing down.
+        let gravity = ["gravity_x", "gravity_y", "gravity_z"]
+            .map(|name| columns.iter().position(|&column| column == name));
+        let gravity = match gravity {
+            [Some(x), Some(y), Some(z)] => Some([x, y, z]),
+            _ => None,
+        };
         let mut samples = Vec::new();
         for line in lines.filter(|line| !line.trim().is_empty()) {
             let values: Vec<_> = line.split(',').collect();
-            let mut parsed = [0.; 4];
-            for (dest, index) in parsed.iter_mut().zip([t, x, y, z]) {
-                *dest = values
+            let number = |index: usize| {
+                values
                     .get(index)
                     .and_then(|v| v.trim().parse::<f64>().ok())
                     .filter(|v| v.is_finite())
-                    .ok_or(invalid("invalid IMU sample"))?;
-            }
+                    .ok_or(invalid("invalid IMU sample"))
+            };
+            let gravity = match gravity {
+                Some([x, y, z]) => Some([number(x)?, number(y)?, number(z)?]),
+                None => None,
+            };
             samples.push(ImuSample {
-                time_s: parsed[0],
-                gyro: [parsed[1], parsed[2], parsed[3]],
+                time_s: number(t)?,
+                gyro: [number(x)?, number(y)?, number(z)?],
+                gravity,
                 orientation: [1., 0., 0., 0.],
             });
         }
@@ -79,22 +92,47 @@ impl ImuTrack {
             sample.time_s -= origin;
         }
         for i in 1..samples.len() {
-            let dt = samples[i].time_s - samples[i - 1].time_s;
-            let angle = std::array::from_fn(|axis| {
-                (samples[i - 1].gyro[axis] + samples[i].gyro[axis]) * dt * 0.5
-            });
-            samples[i].orientation =
-                quaternion_product(samples[i - 1].orientation, angle_quaternion(angle));
+            samples[i].orientation = integrate(&samples[i - 1], &samples[i]);
         }
         Ok(Self { samples })
     }
 
+    /// An empty track for live input; see `push`.
+    pub fn live() -> Self {
+        Self {
+            samples: Vec::new(),
+        }
+    }
+
+    /// Appends a sample that is later than all others; earlier ones are ignored.
+    /// `gyro` is in rad/s and `gravity` points toward the ground, both in IMU axes.
+    pub fn push(&mut self, time_s: f64, gyro: [f64; 3], gravity: Option<[f64; 3]>) {
+        let mut sample = ImuSample {
+            time_s,
+            gyro,
+            gravity,
+            orientation: [1., 0., 0., 0.],
+        };
+        if let Some(previous) = self.samples.last() {
+            if time_s <= previous.time_s {
+                return;
+            }
+            sample.orientation = integrate(previous, &sample);
+        }
+        self.samples.push(sample);
+    }
+
+    /// Time of the newest sample.
     pub fn duration_s(&self) -> f64 {
-        self.samples.last().unwrap().time_s
+        self.samples.last().map_or(0., |sample| sample.time_s)
     }
 
     fn bracket(&self, time_s: f64) -> Option<(usize, f64)> {
-        if !time_s.is_finite() || time_s < 0. || time_s > self.duration_s() {
+        if self.samples.len() < 2
+            || !time_s.is_finite()
+            || time_s < self.samples[0].time_s
+            || time_s > self.duration_s()
+        {
             return None;
         }
         let i = self
@@ -113,6 +151,16 @@ impl ImuTrack {
         Some(std::array::from_fn(|k| {
             self.samples[i - 1].gyro[k] * (1. - a) + self.samples[i].gyro[k] * a
         }))
+    }
+
+    /// Unit vector toward the ground in IMU axes. `None` without gravity columns
+    /// in the CSV or without samples around `time_s`.
+    pub fn gravity_at(&self, time_s: f64) -> Option<[f64; 3]> {
+        let (i, a) = self.bracket(time_s)?;
+        let (p, q) = (self.samples[i - 1].gravity?, self.samples[i].gravity?);
+        let g: [f64; 3] = std::array::from_fn(|k| p[k] * (1. - a) + q[k] * a);
+        let norm = g.iter().map(|v| v * v).sum::<f64>().sqrt();
+        (norm > 1e-6).then(|| g.map(|v| v / norm))
     }
 
     fn orientation(&self, time_s: f64) -> Option<Rotation> {
@@ -149,6 +197,13 @@ impl ImuTrack {
         );
         Some(multiply(multiply(mount, relative), transpose(mount)))
     }
+}
+
+/// Orientation after `sample`, from the orientation of the sample before it.
+fn integrate(previous: &ImuSample, sample: &ImuSample) -> [f64; 4] {
+    let dt = sample.time_s - previous.time_s;
+    let angle = std::array::from_fn(|axis| (previous.gyro[axis] + sample.gyro[axis]) * dt * 0.5);
+    quaternion_product(previous.orientation, angle_quaternion(angle))
 }
 
 pub struct Camera {
@@ -227,6 +282,11 @@ impl Camera {
         ];
         (p[0].is_finite() && p[1].is_finite()).then_some(p)
     }
+
+    /// Pinhole parameters of the undistorted image: fx, fy, cx, cy in pixels.
+    pub fn intrinsics(&self) -> [f64; 4] {
+        [self.fx, self.fy, self.cx, self.cy]
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -276,41 +336,16 @@ pub fn compensate(
     imu: &ImuTrack,
     config: MotionConfig,
 ) -> MotionFrame {
-    let reference = end_us.saturating_sub(origin_us) as f64 * 1e-6 + config.offset_s;
-    let start = start_us.saturating_sub(origin_us) as f64 * 1e-6 + config.offset_s;
-    let covered = imu
-        .relative_rotation(start, reference, config.mount)
-        .is_some();
-    // Cache rotations every 0.5 ms; interpolate rays between bins to retain subpixel precision.
-    let bins = ((end_us - start_us).div_ceil(500) as usize).max(1);
-    let rotations: Vec<_> = (0..=bins)
-        .map(|i| {
-            let t = start + (reference - start) * i as f64 / bins as f64;
-            imu.relative_rotation(t, reference, config.mount)
-                .unwrap_or(IDENTITY)
+    let original: Vec<_> = events
+        .iter()
+        .map(|&event| {
+            camera
+                .ray(event)
+                .and_then(|r| camera.project(r))
+                .unwrap_or([-1., -1.])
         })
         .collect();
-    let mut original = Vec::with_capacity(events.len());
-    let mut compensated = Vec::with_capacity(events.len());
-    for &event in events {
-        let ray = camera.ray(event);
-        original.push(ray.and_then(|r| camera.project(r)).unwrap_or([-1., -1.]));
-        let p = ray.and_then(|r| {
-            if !covered {
-                return camera.project(r);
-            }
-            let a = ((event.timestamp_us.saturating_sub(start_us)) as f64
-                / (end_us - start_us).max(1) as f64
-                * bins as f64)
-                .clamp(0., bins as f64);
-            let i = (a as usize).min(bins - 1);
-            let w = a - i as f64;
-            let p = transform(rotations[i], r);
-            let q = transform(rotations[i + 1], r);
-            camera.project(std::array::from_fn(|k| p[k] * (1. - w) + q[k] * w))
-        });
-        compensated.push(p.unwrap_or([-1., -1.]));
-    }
+    let (covered, compensated) = warp(events, origin_us, start_us, end_us, camera, imu, config);
     let foreground_off = segment(events, &original, start_us, end_us, camera, config);
     let foreground_on = if covered {
         segment(events, &compensated, start_us, end_us, camera, config)
@@ -328,6 +363,84 @@ pub fn compensate(
         focus_off,
         focus_on,
     }
+}
+
+/// Compensated events and their foreground mask, without the uncompensated
+/// comparison and focus measures that `compensate` also computes.
+pub struct ForegroundFrame {
+    /// Undistorted pixel per input event in the camera orientation at the end
+    /// of the window; `[-1, -1]` when the event has no valid projection.
+    pub points: Vec<[f32; 2]>,
+    pub foreground: Vec<bool>,
+    pub imu_covered: bool,
+}
+
+pub fn compensate_foreground(
+    events: &[Event],
+    origin_us: u64,
+    start_us: u64,
+    end_us: u64,
+    camera: &Camera,
+    imu: &ImuTrack,
+    config: MotionConfig,
+) -> ForegroundFrame {
+    let (imu_covered, points) = warp(events, origin_us, start_us, end_us, camera, imu, config);
+    let foreground = if imu_covered {
+        segment(events, &points, start_us, end_us, camera, config)
+    } else {
+        vec![false; events.len()]
+    };
+    ForegroundFrame {
+        points,
+        foreground,
+        imu_covered,
+    }
+}
+
+/// Rotates every event into the camera orientation at `end_us`. Returns whether
+/// the IMU covers the window; without coverage the events are only undistorted.
+fn warp(
+    events: &[Event],
+    origin_us: u64,
+    start_us: u64,
+    end_us: u64,
+    camera: &Camera,
+    imu: &ImuTrack,
+    config: MotionConfig,
+) -> (bool, Vec<[f32; 2]>) {
+    let reference = end_us.saturating_sub(origin_us) as f64 * 1e-6 + config.offset_s;
+    let start = start_us.saturating_sub(origin_us) as f64 * 1e-6 + config.offset_s;
+    let covered = imu
+        .relative_rotation(start, reference, config.mount)
+        .is_some();
+    // Cache rotations every 0.5 ms; interpolate rays between bins to retain subpixel precision.
+    let bins = ((end_us - start_us).div_ceil(500) as usize).max(1);
+    let rotations: Vec<_> = (0..=bins)
+        .map(|i| {
+            let t = start + (reference - start) * i as f64 / bins as f64;
+            imu.relative_rotation(t, reference, config.mount)
+                .unwrap_or(IDENTITY)
+        })
+        .collect();
+    let mut compensated = Vec::with_capacity(events.len());
+    for &event in events {
+        let p = camera.ray(event).and_then(|r| {
+            if !covered {
+                return camera.project(r);
+            }
+            let a = ((event.timestamp_us.saturating_sub(start_us)) as f64
+                / (end_us - start_us).max(1) as f64
+                * bins as f64)
+                .clamp(0., bins as f64);
+            let i = (a as usize).min(bins - 1);
+            let w = a - i as f64;
+            let p = transform(rotations[i], r);
+            let q = transform(rotations[i + 1], r);
+            camera.project(std::array::from_fn(|k| p[k] * (1. - w) + q[k] * w))
+        });
+        compensated.push(p.unwrap_or([-1., -1.]));
+    }
+    (covered, compensated)
 }
 
 fn cell_index(p: [f32; 2], width: usize, height: usize, cell: usize) -> Option<usize> {

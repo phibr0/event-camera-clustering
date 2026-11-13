@@ -5,6 +5,7 @@ mod evt3;
 use crate::Event;
 use crate::Result;
 use evt2::{DecodedEvt2, Evt2Reader, ExtTrigger, RawHeader, read_raw_header};
+pub use evt3::Evt3Decoder;
 use evt3::Evt3EventStream;
 use evt21::Evt21EventStream;
 use std::fmt;

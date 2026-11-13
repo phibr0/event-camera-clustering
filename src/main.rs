@@ -1,3 +1,5 @@
+mod ball_view;
+mod camera;
 mod comparison;
 mod render;
 mod viewer;
@@ -44,6 +46,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if matches!(cli.command, CommandName::MotionCompare) {
         return comparison::run(cli.path, cli.motion, format, endian);
     }
+    if matches!(cli.command, CommandName::Ball3d) {
+        return ball_view::run(cli.path, cli.motion, cli.ball, format, endian);
+    }
 
     match cli.command {
         CommandName::TrackBall => track_ball(
@@ -68,7 +73,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             format,
             endian,
         ),
-        CommandName::MotionCompare => unreachable!(),
+        CommandName::MotionCompare | CommandName::Ball3d => unreachable!(),
     }
 }
 
@@ -86,7 +91,12 @@ fn normalize_args(mut args: Vec<String>) -> Vec<String> {
     if args.len() == 1 {
         args.push("--help".to_owned());
     }
-    if args.len() >= 3 && matches!(args[1].as_str(), "track-ball" | "view" | "motion-compare") {
+    if args.len() >= 3
+        && matches!(
+            args[1].as_str(),
+            "track-ball" | "view" | "motion-compare" | "ball-3d"
+        )
+    {
         args.swap(1, 2);
     }
     args
@@ -228,6 +238,9 @@ struct Cli {
     #[command(flatten)]
     motion: comparison::MotionArgs,
 
+    #[command(flatten)]
+    ball: ball_view::BallArgs,
+
     #[arg(long)]
     max_detections: Option<u64>,
 }
@@ -237,6 +250,8 @@ enum CommandName {
     TrackBall,
     View,
     MotionCompare,
+    #[value(name = "ball-3d")]
+    Ball3d,
 }
 
 #[derive(Debug, Args)]

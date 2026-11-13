@@ -1,5 +1,6 @@
 pub mod algorithms;
 pub mod ball;
+pub mod ball_tracker;
 pub mod error;
 pub mod event;
 pub mod filter;
